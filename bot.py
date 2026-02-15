@@ -324,6 +324,46 @@ def select_best_market(markets, min_time_remaining: int):
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
+def parse_fast_market_window_utc(question: str):
+    import re
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+    except Exception:
+        et = None
+
+    q = question or ""
+    m = re.search(r"([A-Za-z]+ \d+),\s*(\d{1,2}:\d{2}(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
+    if not m:
+        return None, None
+
+    date_str, start_str, end_str = m.group(1), m.group(2), m.group(3)
+    year = now_utc().year
+
+    try:
+        start_local = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
+        end_local   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
+
+        if et:
+            start_local = start_local.replace(tzinfo=et)
+            end_local = end_local.replace(tzinfo=et)
+            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+        # fallback (no zoneinfo)
+        start_utc = start_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        end_utc = end_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        return start_utc, end_utc
+    except Exception:
+        return None, None
+
+def is_future_market(question: str) -> bool:
+    start, end = parse_fast_market_window_utc(question or "")
+    if not start or not end:
+        return False
+    # If market starts more than 2 minutes from now, treat as "future"
+    return start > (now_utc() + timedelta(minutes=2))
+
+
 
 # -----------------------
 # Signal
@@ -409,7 +449,9 @@ def import_market(api_key: str, slug: str):
     return None, f"unexpected import status: {status}"
 
 
-def execute_trade(api_key: str, market_id: str, side: str, amount: float):
+def execute_trade(api_key: str, market_id: str, side: str, amount: float, action: str = "buy"):
+    # side: "yes" or "no"
+    # action: "buy" or "sell"
     return simmer_request(
         "/api/sdk/trade",
         method="POST",
@@ -417,6 +459,7 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float):
             "market_id": market_id,
             "side": side,
             "amount": amount,
+            "action": action,          # ✅ IMPORTANT
             "venue": "polymarket",
             "source": TRADE_SOURCE,
         },
@@ -435,6 +478,39 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
     if bal <= 0:
         return max_size
     return min(max_size, bal * smart_pct)
+
+def close_future_positions(api_key: str, positions):
+    closed_any = False
+
+    for p in positions:
+        q = p.get("question") or ""
+        if "up or down" not in q.lower():
+            continue
+
+        if not is_future_market(q):
+            continue
+
+        market_id = p.get("market_id") or p.get("id") or p.get("marketId")
+        if not market_id:
+            append_journal({"type":"warn","reason":"no_market_id_to_close","question":q})
+            continue
+
+        shares_yes = float(p.get("shares_yes", 0) or 0)
+        shares_no  = float(p.get("shares_no", 0) or 0)
+
+        # We sell the side we hold
+        if shares_yes > 0:
+            res = execute_trade(api_key, market_id, "yes", amount=float(min(shares_yes, shares_yes)), action="sell")
+            append_journal({"type":"close_attempt","side":"sell_yes","market_id":market_id,"question":q,"result":res})
+            closed_any = True
+
+        if shares_no > 0:
+            res = execute_trade(api_key, market_id, "no", amount=float(min(shares_no, shares_no)), action="sell")
+            append_journal({"type":"close_attempt","side":"sell_no","market_id":market_id,"question":q,"result":res})
+            closed_any = True
+
+    return closed_any
+
 
 
 # -----------------------
@@ -504,12 +580,19 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
-    if os.environ.get("TRADING_ENABLED", "true").lower() not in ("true", "1", "yes"):
+    if os.environ.get("TRADING_ENABLED", "false").lower() not in ("true", "1", "yes"):
         log("SKIP: TRADING_ENABLED is false", force=True)
         append_journal({"type": "skip", "reason": "trading_disabled"})
         return
 
     positions = get_positions(api_key)
+
+    closed_any = close_future_positions(api_key, positions)
+    if closed_any:
+        print("INFO: attempted to close future positions")
+        # refresh positions after closing
+        positions = get_positions(api_key)
+
     active_slugs = active_fast_market_slugs(cfg["asset"], cfg["window"])
     open_fast = count_open_fast_positions(positions, active_slugs)
     if open_fast >= int(cfg["max_open_fast_positions"]):
