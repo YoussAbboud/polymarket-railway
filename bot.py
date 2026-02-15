@@ -248,31 +248,53 @@ def select_best_market(markets, min_time_remaining: int):
 # Signal
 # -----------------------
 def get_binance_momentum(symbol: str, lookback_minutes: int):
-    url = (
-        "https://api.binance.com/api/v3/klines"
-        f"?symbol={symbol}&interval=1m&limit={lookback_minutes}"
-    )
-    candles = api_request(url)
-    if not isinstance(candles, list) or len(candles) < 2:
-        return None
-    try:
-        price_then = float(candles[0][1])      # open oldest
-        price_now = float(candles[-1][4])      # close newest
-        momentum_pct = ((price_now - price_then) / price_then) * 100.0
-        direction = "up" if momentum_pct > 0 else "down"
-        vols = [float(c[5]) for c in candles]
-        avg_vol = sum(vols) / len(vols) if vols else 0.0
-        latest_vol = vols[-1] if vols else 0.0
-        vol_ratio = (latest_vol / avg_vol) if avg_vol > 0 else 1.0
-        return {
-            "price_now": price_now,
-            "price_then": price_then,
-            "momentum_pct": momentum_pct,
-            "direction": direction,
-            "volume_ratio": vol_ratio,
-        }
-    except Exception:
-        return None
+    bases = [
+        "https://api.binance.com",
+        "https://api1.binance.com",
+        "https://api2.binance.com",
+        "https://api3.binance.com",
+        "https://data-api.binance.vision"  # great fallback if api.binance.com is blocked
+    ]
+
+    last_err = None
+    for base in bases:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback_minutes}"
+        candles = api_request(url, timeout=25)
+
+        # If Binance returns an error dict, store it and try next
+        if isinstance(candles, dict) and candles.get("error"):
+            last_err = {"base": base, **candles}
+            continue
+
+        if not isinstance(candles, list) or len(candles) < 2:
+            last_err = {"base": base, "error": "bad_response", "sample": str(candles)[:200]}
+            continue
+
+        try:
+            price_then = float(candles[0][1])      # open oldest
+            price_now = float(candles[-1][4])      # close newest
+            momentum_pct = ((price_now - price_then) / price_then) * 100.0
+            direction = "up" if momentum_pct > 0 else "down"
+
+            vols = [float(c[5]) for c in candles]
+            avg_vol = sum(vols) / len(vols) if vols else 0.0
+            latest_vol = vols[-1] if vols else 0.0
+            vol_ratio = (latest_vol / avg_vol) if avg_vol > 0 else 1.0
+
+            return {
+                "price_now": price_now,
+                "price_then": price_then,
+                "momentum_pct": momentum_pct,
+                "direction": direction,
+                "volume_ratio": vol_ratio,
+                "binance_base": base,
+            }
+        except Exception as e:
+            last_err = {"base": base, "error": f"parse_error: {e}"}
+            continue
+
+    # If all bases fail, return None but keep debug info accessible
+    return {"error": "all_binance_endpoints_failed", "details": last_err}
 
 
 # -----------------------
