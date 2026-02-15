@@ -677,11 +677,15 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     else:
         print("DEBUG: no positions returned")
 
+    print(f"DEBUG: positions fetched = {len(positions)}")
+    print("DEBUG: running close_future_positions() now...")
     closed_any = close_future_positions(api_key, positions, quiet=quiet)
+    print(f"DEBUG: close_future_positions returned {closed_any}")
     if closed_any:
         print("INFO: attempted to close future positions")
         # refresh positions after closing
         positions = get_positions(api_key)
+        print(f"DEBUG: positions after close attempt = {len(positions)}")
 
     open_fast = count_open_fast_positions(positions)
     if open_fast >= int(cfg["max_open_fast_positions"]):
