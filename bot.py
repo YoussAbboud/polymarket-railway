@@ -262,6 +262,18 @@ def discover_fast_markets(asset: str, window: str):
 
         start, end = gamma_market_window(m)
 
+        # MUST have a usable window
+        if not start or not end:
+            continue
+
+        # Optional sanity: window duration must roughly match cfg window
+        expected = {"1m": 60, "3m": 180, "5m": 300, "15m": 900}.get(window)
+        if expected:
+            dur = (end - start).total_seconds()
+            if dur < expected - 90 or dur > expected + 90:
+                continue
+
+
         # ✅ HARD FILTER: only CURRENTLY LIVE windows
         if not is_live_window(start, end, grace_s=20):
             continue
@@ -503,72 +515,6 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
         return max_size
     return min(max_size, bal * smart_pct)
 
-def close_future_positions(api_key: str, positions):
-    """
-    Close positions that are NOT appropriate to hold right now:
-    - future windows (start > now + 2m)
-    - expired windows (end < now - small grace)
-    Uses question parsing fallback (ET heuristic).
-    """
-    closed_any = False
-    now = now_utc()
-
-    for p in positions or []:
-        q = (p.get("question") or "").strip()
-        if "up or down" not in q.lower():
-            continue
-
-        win = parse_fast_market_window_utc(q)
-        if not win:
-            append_journal({"type": "warn", "reason": "cannot_parse_window", "question": q})
-            continue
-
-        start_utc, end_utc = win
-
-        # classify
-        is_future = start_utc > (now + timedelta(minutes=2))
-        is_expired = end_utc < (now - timedelta(seconds=30))
-
-        if not (is_future or is_expired):
-            continue  # keep live/near-live positions
-
-        market_id = p.get("market_id") or p.get("id") or p.get("marketId")
-        if not market_id:
-            append_journal({"type": "warn", "reason": "no_market_id_to_close", "question": q})
-            continue
-
-        shares_yes = float(p.get("shares_yes", 0) or 0)
-        shares_no  = float(p.get("shares_no", 0) or 0)
-
-        # SELL requires shares, not amount
-        if shares_yes > 0:
-            res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
-            append_journal({
-                "type": "close_attempt",
-                "why": "future" if is_future else "expired",
-                "side": "sell_yes",
-                "market_id": market_id,
-                "question": q,
-                "shares": shares_yes,
-                "result": res
-            })
-            closed_any = True
-
-        if shares_no > 0:
-            res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
-            append_journal({
-                "type": "close_attempt",
-                "why": "future" if is_future else "expired",
-                "side": "sell_no",
-                "market_id": market_id,
-                "question": q,
-                "shares": shares_no,
-                "result": res
-            })
-            closed_any = True
-
-    return closed_any
-
 # -----------------------
 # Risk + state
 # -----------------------
@@ -778,32 +724,26 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
-    start = best.get("start_time")
-    end   = best.get("end_time")
-    if not is_live_window(start, end, grace_s=20):
-        print(f"SKIP: selected market is not live (gamma start={start}, end={end})")
-        return
-    
     if not best:
         log("SKIP: no market with enough time remaining", force=True)
         append_journal({"type": "skip", "reason": "no_best_market"})
         return
-    
-    win = parse_fast_market_window_utc(best.get("question", ""))
-    if not win:
-        log("SKIP: couldn't parse market window from question", force=True)
-        append_journal({"type": "skip", "reason": "window_parse_failed", "question": best.get("question")})
+
+    start = best.get("start_time")
+    end   = best.get("end_time")
+
+    # Safety: should already be live because discover_fast_markets hard-filters it,
+    # but keep a guard anyway.
+    if not is_live_window(start, end, grace_s=20):
+        log(f"SKIP: selected market is not live (gamma start={start}, end={end})", force=True)
+        append_journal({"type": "skip", "reason": "best_not_live", "slug": best.get("slug"), "question": best.get("question")})
         return
 
-    start_utc, end_utc = win
-    if start_utc and start_utc > now_utc() + timedelta(minutes=2):
-        log(f"SKIP: selected market is not live yet (starts {start_utc.isoformat()})", force=True)
-        append_journal({"type": "skip", "reason": "market_not_live_yet", "question": best["question"], "slug": best["slug"]})
+    if not has_time_remaining(end, int(cfg["min_time_remaining"])):
+        log("SKIP: no market with enough time remaining", force=True)
+        append_journal({"type": "skip", "reason": "too_close_to_expiry", "slug": best.get("slug"), "question": best.get("question")})
         return
-    if not best:
-        log("SKIP: no market with enough time remaining")
-        append_journal({"type": "skip", "reason": "too_close_to_expiry"})
-        return
+
 
     # ✅ lock check (prevents duplicate orders across cron runs)
     if has_recent_lock(best["slug"]):
