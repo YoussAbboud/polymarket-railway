@@ -414,13 +414,17 @@ def count_open_fast_positions(positions):
         ql = q.lower()
         if "up or down" not in ql:
             continue
+
+        # ✅ ignore expired windows
         if is_market_expired(q):
-            continue  # ✅ don't count expired
+            continue
+
         yes = float(p.get("shares_yes", 0) or 0)
         no = float(p.get("shares_no", 0) or 0)
         if yes > 0 or no > 0:
             n += 1
     return n
+
 
 
 def already_in_this_market(positions, question: str):
