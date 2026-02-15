@@ -725,7 +725,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
     if not best:
-        og("SKIP: no market with enough time remaining", force=True)
+        log("SKIP: no market with enough time remaining", force=True)
         append_journal({"type": "skip", "reason": "no_best_market"})
         return
     
