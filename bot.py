@@ -586,6 +586,12 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     positions = get_positions(api_key)
+    # DEBUG: print one position so we can see the exact Simmer fields
+    if positions:
+        print("DEBUG position keys:", list(positions[0].keys()))
+        print("DEBUG first position sample:", json.dumps(positions[0], indent=2)[:4000])
+    else:
+        print("DEBUG: no positions returned")
 
     closed_any = close_future_positions(api_key, positions)
     if closed_any:
