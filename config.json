@@ -9,7 +9,7 @@
   "min_time_remaining": 45,
   "min_volume_ratio": 0.25,
 
-  "max_position": 2.0,
+  "max_position": 3.0,
   "smart_sizing_pct": 0.05,
 
   "max_open_fast_positions": 1,
