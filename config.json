@@ -1,0 +1,20 @@
+{
+  "asset": "BTC",
+  "window": "5m",
+  "signal_source": "binance",
+  "lookback_minutes": 5,
+
+  "entry_threshold": 0.05,
+  "min_momentum_pct": 0.30,
+  "min_time_remaining": 45,
+  "min_volume_ratio": 0.60,
+
+  "max_position": 5.0,
+  "smart_sizing_pct": 0.05,
+
+  "max_open_fast_positions": 1,
+  "cooldown_seconds": 120,
+  "daily_trade_limit": 20,
+
+  "fee_edge_buffer": 0.02
+}
