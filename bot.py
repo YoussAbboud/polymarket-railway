@@ -408,6 +408,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
+    if os.environ.get("TRADING_ENABLED", "true").lower() not in ("true", "1", "yes"):
+        log("SKIP: TRADING_ENABLED is false", force=True)
+        append_journal({"type": "skip", "reason": "trading_disabled"})
+        return
+
     positions = get_positions(api_key)
     open_fast = count_open_fast_positions(positions)
     if open_fast >= int(cfg["max_open_fast_positions"]):
