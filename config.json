@@ -7,7 +7,7 @@
   "entry_threshold": 0.05,
   "min_momentum_pct": 0.08,
   "min_time_remaining": 45,
-  "min_volume_ratio": 0.25,
+  "min_volume_ratio": 0.15,
 
   "max_position": 3.0,
   "smart_sizing_pct": 0.05,
