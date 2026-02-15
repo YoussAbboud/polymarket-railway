@@ -39,7 +39,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
 GAMMA_MARKETS_URL = (
     "https://gamma-api.polymarket.com/markets"
-    "?limit=20&closed=false&tag=crypto&order=createdAt&ascending=false"
+    "?limit=200&closed=false&tag=crypto&order=createdAt&ascending=false"
 )
 
 ASSET_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
@@ -251,101 +251,91 @@ def discover_fast_markets(asset: str, window: str):
     result = api_request(GAMMA_MARKETS_URL)
     if not isinstance(result, list):
         return []
+
     out = []
     for m in result:
-        print("DEBUG gamma market keys:", list(m.keys()))
-        q = (m.get("question") or "").lower()
-        slug = m.get("slug", "") or ""
+        q = (m.get("question") or "")
+        ql = q.lower()
+        slug = (m.get("slug") or "")
+
         if f"-{window}-" not in slug:
             continue
-        if not any(p in q for p in patterns):
+        if not any(p in ql for p in patterns):
             continue
         if m.get("closed"):
             continue
-        start_utc, end_utc = parse_fast_market_window_utc(m.get("question", ""))
-        out.append(
-            {
-                "question": m.get("question", ""),
-                "slug": slug,
-                "start_time": start_utc,
-                "end_time": end_utc,
-                "outcome_prices": m.get("outcomePrices", "[]"),
-                "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-            }
-        )
+
+        start_dt, end_dt = gamma_market_window(m)
+        out.append({
+            "question": q,
+            "slug": slug,
+            "start_time": start_dt,
+            "end_time": end_dt,
+            "outcome_prices": m.get("outcomePrices", "[]"),
+            "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+            "accepting_orders": m.get("acceptingOrders", None),
+            "active": m.get("active", None),
+        })
     return out
+
 
 
 def select_best_market(markets, min_time_remaining: int):
     now = now_utc()
-
-    # allow entering slightly before the window starts, and slightly after it ends
-    lead_seconds = 20        # can enter up to 20s before start
-    grace_seconds = 60       # still consider it live up to 60s after end (market may stay tradable)
-
     candidates = []
+
     for m in markets:
         start = m.get("start_time")
         end = m.get("end_time")
         if not start or not end:
             continue
 
-        # ✅ must be today's window (prevents picking Feb 16 when it's Feb 15)
-        # We enforce "same UTC date as now" as a simple guard.
-        # (If you want ET-day specifically, we can tighten it.)
-        if start.date() != now.date():
-            continue
-
-        # ✅ only consider live-ish window
-        if now < (start - timedelta(seconds=lead_seconds)):
-            continue
-        if now > (end + timedelta(seconds=grace_seconds)):
+        # Only markets that have started (or are about to start in the next 30s)
+        if start > now + timedelta(seconds=30):
             continue
 
         remaining = (end - now).total_seconds()
-        if remaining < min_time_remaining:
-            continue
-
-        candidates.append((remaining, m))
+        if remaining > min_time_remaining:
+            candidates.append((remaining, m))
 
     if not candidates:
         return None
 
-    # choose the one ending soonest (current window)
+    # choose the one that ends soonest (your original logic)
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
-def parse_fast_market_window_utc(question: str):
-    import re
+
+def parse_iso_dt(s: str):
+    # Gamma gives e.g. "2026-02-15T19:30:00Z"
+    if not s:
+        return None
     try:
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
+        s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
     except Exception:
-        et = None
+        return None
 
-    q = question or ""
-    m = re.search(r"([A-Za-z]+ \d+),\s*(\d{1,2}:\d{2}(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
-    if not m:
-        return None, None
 
-    date_str, start_str, end_str = m.group(1), m.group(2), m.group(3)
-    year = now_utc().year
+def gamma_market_window(m: dict):
+    # Prefer ISO fields if present
+    start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
+    end = parse_iso_dt(m.get("endDateIso")) or parse_iso_dt(m.get("end_date_iso"))
 
-    try:
-        start_local = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
-        end_local   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
+    # Fallback: numeric fields (sometimes ms)
+    if not start and m.get("startDate"):
+        ts = float(m["startDate"])
+        if ts > 1e12:  # ms
+            ts /= 1000.0
+        start = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-        if et:
-            start_local = start_local.replace(tzinfo=et)
-            end_local = end_local.replace(tzinfo=et)
-            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+    if not end and m.get("endDate"):
+        ts = float(m["endDate"])
+        if ts > 1e12:  # ms
+            ts /= 1000.0
+        end = datetime.fromtimestamp(ts, tz=timezone.utc)
 
-        # fallback (no zoneinfo)
-        start_utc = start_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        end_utc = end_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        return start_utc, end_utc
-    except Exception:
-        return None, None
+    return start, end
 
 def is_future_market(question: str) -> bool:
     start, end = parse_fast_market_window_utc(question or "")
