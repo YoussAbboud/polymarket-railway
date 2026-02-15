@@ -12,12 +12,13 @@ Improvements:
 - Risk caps: max open positions, cooldown, daily trade limit
 - Persistent state + trade journal on /data (Railway Volume)
 
-Refs:
-- Railway cron expects "run task then exit" :contentReference[oaicite:4]{index=4}
-- Railway Volumes for persistence :contentReference[oaicite:5]{index=5}
+Additional hardening:
+- Local lock w/ TTL in /data to prevent duplicate orders on API timeouts
+- Longer Simmer timeouts for import/trade
+- Verify position after timeout (trade may have succeeded server-side)
 """
 
-import os, sys, json, argparse
+import os, sys, json, argparse, time
 from datetime import datetime, timezone, timedelta, date
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
@@ -49,7 +50,10 @@ ASSET_PATTERNS = {
 }
 
 TRADE_SOURCE = "railway:fastloop"
-MIN_SHARES_PER_ORDER = 5
+MIN_SHARES_PER_ORDER = 5  # consider 3 if you want smaller trades
+
+# Lock TTL (seconds) to prevent duplicate orders on timeouts / lag
+LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "900"))  # 15 minutes
 
 
 # -----------------------
@@ -104,11 +108,17 @@ def api_request(url, method="GET", data=None, headers=None, timeout=45):
         return {"error": str(e)}
 
 
-def simmer_request(path, method="GET", data=None, api_key=None):
+def simmer_request(path, method="GET", data=None, api_key=None, timeout=45):
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    return api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers)
+    return api_request(
+        f"{SIMMER_BASE}{path}",
+        method=method,
+        data=data,
+        headers=headers,
+        timeout=timeout
+    )
 
 
 def get_api_key():
@@ -117,6 +127,31 @@ def get_api_key():
         print("ERROR: SIMMER_API_KEY is not set")
         sys.exit(1)
     return key
+
+
+# -----------------------
+# Lock helpers
+# -----------------------
+def lock_path_for(slug: str) -> str:
+    safe = (slug or "").replace("/", "_")
+    return os.path.join(DATA_DIR, f"lock_{safe}.json")
+
+
+def has_recent_lock(slug: str) -> bool:
+    path = lock_path_for(slug)
+    data = load_json(path, None)
+    if not isinstance(data, dict) or "ts" not in data:
+        return False
+    try:
+        ts = datetime.fromisoformat(data["ts"])
+        return (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS
+    except Exception:
+        return False
+
+
+def write_lock(slug: str):
+    path = lock_path_for(slug)
+    save_json(path, {"ts": now_utc().isoformat(), "slug": slug})
 
 
 # -----------------------
@@ -157,7 +192,6 @@ def load_config():
     if isinstance(file_cfg, dict):
         cfg.update(file_cfg)
 
-    # env overrides (for core params)
     for k, env in ENV_MAP.items():
         v = os.environ.get(env)
         if v is None:
@@ -179,12 +213,7 @@ def load_config():
 # Market discovery
 # -----------------------
 def parse_fast_market_end_time(question: str):
-    """
-    Very similar to the template bot: it parses "... 5:30AM-5:35AM ET" and treats ET as UTC-5.
-    (This is a heuristic; good enough for choosing the soonest expiring window.)
-    """
     import re
-
     pattern = r"(\w+ \d+),.*?-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET"
     m = re.search(pattern, question or "")
     if not m:
@@ -195,7 +224,6 @@ def parse_fast_market_end_time(question: str):
         year = now_utc().year
         dt_str = f"{date_str} {year} {time_str}"
         dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-        # ET -> UTC (+5 hours)
         return dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
     except Exception:
         return None
@@ -240,7 +268,7 @@ def select_best_market(markets, min_time_remaining: int):
             candidates.append((remaining, m))
     if not candidates:
         return None
-    candidates.sort(key=lambda x: x[0])  # soonest expiring
+    candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
 
@@ -253,7 +281,7 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
         "https://api1.binance.com",
         "https://api2.binance.com",
         "https://api3.binance.com",
-        "https://data-api.binance.vision"  # great fallback if api.binance.com is blocked
+        "https://data-api.binance.vision"
     ]
 
     last_err = None
@@ -261,7 +289,6 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
         url = f"{base}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback_minutes}"
         candles = api_request(url, timeout=25)
 
-        # If Binance returns an error dict, store it and try next
         if isinstance(candles, dict) and candles.get("error"):
             last_err = {"base": base, **candles}
             continue
@@ -271,8 +298,8 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
             continue
 
         try:
-            price_then = float(candles[0][1])      # open oldest
-            price_now = float(candles[-1][4])      # close newest
+            price_then = float(candles[0][1])
+            price_now = float(candles[-1][4])
             momentum_pct = ((price_now - price_then) / price_then) * 100.0
             direction = "up" if momentum_pct > 0 else "down"
 
@@ -293,7 +320,6 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
             last_err = {"base": base, "error": f"parse_error: {e}"}
             continue
 
-    # If all bases fail, return None but keep debug info accessible
     return {"error": "all_binance_endpoints_failed", "details": last_err}
 
 
@@ -301,7 +327,7 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
 # Simmer actions
 # -----------------------
 def get_positions(api_key: str):
-    r = simmer_request("/api/sdk/positions", api_key=api_key)
+    r = simmer_request("/api/sdk/positions", api_key=api_key, timeout=45)
     if isinstance(r, dict) and "positions" in r:
         return r["positions"]
     if isinstance(r, list):
@@ -310,7 +336,7 @@ def get_positions(api_key: str):
 
 
 def get_portfolio(api_key: str):
-    return simmer_request("/api/sdk/portfolio", api_key=api_key)
+    return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
 
 
 def import_market(api_key: str, slug: str):
@@ -320,6 +346,7 @@ def import_market(api_key: str, slug: str):
         method="POST",
         data={"polymarket_url": url, "shared": True},
         api_key=api_key,
+        timeout=60
     )
     if not isinstance(r, dict) or r.get("error"):
         return None, (r.get("error") if isinstance(r, dict) else "import failed")
@@ -341,6 +368,7 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float):
             "source": TRADE_SOURCE,
         },
         api_key=api_key,
+        timeout=60
     )
 
 
@@ -363,7 +391,6 @@ def load_state():
     st = load_json(STATE_PATH, {})
     if not isinstance(st, dict):
         st = {}
-    # daily reset
     today = date.today().isoformat()
     if st.get("day") != today:
         st = {"day": today, "trades": 0, "last_trade_ts": None}
@@ -420,7 +447,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({"type": "skip", "reason": "max_open_positions", "open_fast": open_fast})
         return
 
-    # cooldown
     if st.get("last_trade_ts"):
         last = datetime.fromisoformat(st["last_trade_ts"])
         since = (now_utc() - last).total_seconds()
@@ -429,13 +455,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             append_journal({"type": "skip", "reason": "cooldown", "since_s": since})
             return
 
-    # daily trade limit
     if int(st.get("trades", 0)) >= int(cfg["daily_trade_limit"]):
         log(f"SKIP: daily trade limit hit ({st['trades']}/{cfg['daily_trade_limit']})", force=True)
         append_journal({"type": "skip", "reason": "daily_trade_limit", "trades": st["trades"]})
         return
 
-    # discover + select
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
     if not markets:
         log("SKIP: no active fast markets")
@@ -448,23 +472,25 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({"type": "skip", "reason": "too_close_to_expiry"})
         return
 
-    # prevent duplicates (same window)
+    # ✅ lock check (prevents duplicate orders across cron runs)
+    if has_recent_lock(best["slug"]):
+        log("SKIP: recent lock exists for this market (prevents duplicate orders)", force=True)
+        append_journal({"type": "skip", "reason": "recent_lock", "slug": best["slug"]})
+        return
+
     if already_in_this_market(positions, best["question"]):
         log("SKIP: already have a position in this exact market window", force=True)
         append_journal({"type": "skip", "reason": "already_in_market", "question": best["question"]})
         return
 
-    # market price
     try:
         prices = json.loads(best.get("outcome_prices", "[]"))
         yes_price = float(prices[0]) if prices else 0.5
     except Exception:
         yes_price = 0.5
 
-    # fee
     fee_rate = (int(best.get("fee_rate_bps", 0)) / 10000.0) if best.get("fee_rate_bps") else 0.0
 
-    # signal
     symbol = ASSET_SYMBOLS.get(cfg["asset"], "BTCUSDT")
     sig = get_binance_momentum(symbol, int(cfg["lookback_minutes"]))
     if not sig or (isinstance(sig, dict) and sig.get("error")):
@@ -483,7 +509,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({"type": "skip", "reason": "low_volume", "volume_ratio": sig["volume_ratio"]})
         return
 
-    # decide
     entry = float(cfg["entry_threshold"])
     if sig["direction"] == "up":
         side = "yes"
@@ -499,7 +524,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({"type": "skip", "reason": "priced_in", "yes_price": yes_price, "divergence": divergence})
         return
 
-    # fee-aware minimum edge
     if fee_rate > 0:
         win_profit = (1 - buy_price) * (1 - fee_rate)
         breakeven = buy_price / (win_profit + buy_price)
@@ -510,7 +534,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             append_journal({"type": "skip", "reason": "fee_edge", "divergence": divergence, "min_div": min_div})
             return
 
-    # sizing
     amount = calc_position_size(
         api_key=api_key,
         max_size=float(cfg["max_position"]),
@@ -518,7 +541,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         smart_sizing=smart_sizing,
     )
 
-    # ensure min shares
     if buy_price > 0:
         min_cost = MIN_SHARES_PER_ORDER * buy_price
         if min_cost > amount:
@@ -526,8 +548,8 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             append_journal({"type": "skip", "reason": "min_shares", "amount": amount, "buy_price": buy_price})
             return
 
-    # import + trade
     log(f"SIGNAL: {side.upper()} | YES=${yes_price:.3f} | mom={sig['momentum_pct']:+.3f}% | vol={sig['volume_ratio']:.2f}x", force=True)
+
     market_id, err = import_market(api_key, best["slug"])
     if not market_id:
         log(f"FAIL: import {err}", force=True)
@@ -552,6 +574,9 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             "fee_rate": fee_rate,
         })
         return
+
+    # ✅ write lock only when we're about to submit an order
+    write_lock(best["slug"])
 
     result = execute_trade(api_key, market_id, side, amount)
     if isinstance(result, dict) and result.get("success"):
@@ -579,6 +604,14 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         err = (result.get("error") if isinstance(result, dict) else "no response")
         append_journal({"type": "error", "stage": "trade", "error": err, "market_id": market_id})
         log(f"TRADE: failed ({err})", force=True)
+
+        # ✅ If timeout, verify whether trade actually landed
+        if "timed out" in str(err).lower():
+            time.sleep(2)
+            positions2 = get_positions(api_key)
+            if already_in_this_market(positions2, best["question"]):
+                log("TRADE: success (verified after timeout)", force=True)
+                append_journal({"type": "trade_verified", "market_id": market_id, "question": best["question"]})
 
 
 if __name__ == "__main__":
