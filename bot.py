@@ -280,43 +280,42 @@ def discover_fast_markets(asset: str, window: str):
 
 
 
-def select_best_market(markets, min_time_remaining: int):
-    now = now_utc()
-    candidates = []
+def select_best_market(markets, min_seconds_left: int):
+    live = []
     for m in markets:
+        start = m.get("start_time")
         end = m.get("end_time")
-        if not end:
+
+        if not is_live_window(start, end):          # ✅ filter out future/expired
             continue
-        remaining = (end - now).total_seconds()
-        if remaining >= min_time_remaining:
-            candidates.append((remaining, m))
-    if not candidates:
+        if not has_time_remaining(end, min_seconds_left):  # ✅ filter out “too close”
+            continue
+
+        # pick soonest expiring among valid
+        live.append(((end - now_utc()).total_seconds(), m))
+
+    if not live:
         return None
-    candidates.sort(key=lambda x: x[0])  # soonest expiring live window
-    return candidates[0][1]
+    live.sort(key=lambda x: x[0])
+    return live[0][1]
 
 
-
-def parse_iso_dt(s: str):
-    # Gamma gives e.g. "2026-02-15T19:30:00Z"
-    if not s:
-        return None
-    try:
-        s = s.replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
 
 
 def parse_iso_dt(s):
     if not s:
         return None
     try:
-        # Handles "2026-02-15T19:30:00Z" and "+00:00"
-        s = str(s).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).astimezone(timezone.utc)
+        s = str(s).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
 
 
 def parse_ts_any(v):
@@ -350,13 +349,27 @@ def gamma_market_window(m: dict):
     start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
     end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
 
-    # Fallback: numeric/strings fields
-    if not start:
-        start = parse_ts_any(m.get("startDate") or m.get("start_date"))
-    if not end:
-        end = parse_ts_any(m.get("endDate") or m.get("end_date"))
+    # Fallback: numeric fields (sometimes ms) — HARDENED
+    if not start and m.get("startDate") is not None:
+        try:
+            ts = float(m["startDate"])
+            if ts > 1e12:  # ms
+                ts /= 1000.0
+            start = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            start = None
+
+    if not end and m.get("endDate") is not None:
+        try:
+            ts = float(m["endDate"])
+            if ts > 1e12:  # ms
+                ts /= 1000.0
+            end = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            end = None
 
     return start, end
+
 
 def is_live_window(start: datetime, end: datetime, *, grace_s=20) -> bool:
     if not start or not end:
@@ -765,6 +778,12 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
+    start = best.get("start_time")
+    end   = best.get("end_time")
+    if not is_live_window(start, end, grace_s=20):
+        print(f"SKIP: selected market is not live (gamma start={start}, end={end})")
+        return
+    
     if not best:
         log("SKIP: no market with enough time remaining", force=True)
         append_journal({"type": "skip", "reason": "no_best_market"})
