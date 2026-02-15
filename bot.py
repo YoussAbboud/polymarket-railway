@@ -214,45 +214,35 @@ def load_config():
 # -----------------------
 def parse_fast_market_window_utc(question: str):
     """
-    Parse: "Bitcoin Up or Down - February 16, 2:55PM-3:00PM ET"
-    Return (start_utc, end_utc) as timezone-aware UTC datetimes, or (None, None).
-    Assumes ET = America/New_York (handles DST properly if zoneinfo exists).
+    Parses:
+      "Bitcoin Up or Down - February 16, 2:55PM-3:00PM ET"
+    Returns (start_utc, end_utc) as timezone-aware UTC datetimes.
+    Assumes ET = UTC-5 (your existing heuristic).
     """
     import re
-    try:
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-    except Exception:
-        et = None  # fallback below
-
     q = question or ""
-    m = re.search(r"([A-Za-z]+ \d+),\s*(\d{1,2}:\d{2}(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
+
+    m = re.search(r"([A-Za-z]+ \d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
     if not m:
-        return None, None
-
-    date_str = m.group(1)   # "February 16"
-    start_str = m.group(2)  # "2:55PM"
-    end_str = m.group(3)    # "3:00PM"
-
-    # Use current year, but we will later filter to "today" in ET to avoid tomorrow picks.
-    year = now_utc().year
+        return None
 
     try:
-        start_local = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
-        end_local   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
+        date_str = m.group(1)      # "February 16"
+        start_str = m.group(2)     # "2:55PM"
+        end_str = m.group(3)       # "3:00PM"
+        year = now_utc().year
 
-        if et:
-            start_local = start_local.replace(tzinfo=et)
-            end_local = end_local.replace(tzinfo=et)
-            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+        start_et = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
+        end_et   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
 
-        # Fallback: ET approx. (better than your +5 hardcode but still imperfect in DST)
-        # If you can't use zoneinfo, keep your old assumption:
-        start_utc = start_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        end_utc = end_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        # ET -> UTC (+5h) per your existing logic
+        start_utc = start_et.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        end_utc   = end_et.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+
         return start_utc, end_utc
     except Exception:
-        return None, None
+        return None
+
 
 
 
@@ -734,7 +724,13 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
-    start_utc, end_utc = parse_fast_market_window_utc(best["question"])
+    win = parse_fast_market_window_utc(best.get("question", ""))
+    if not win:
+        log("SKIP: couldn't parse market window from question", force=True)
+        append_journal({"type": "skip", "reason": "window_parse_failed", "question": best.get("question")})
+        return
+
+    start_utc, end_utc = win
     if start_utc and start_utc > now_utc() + timedelta(minutes=2):
         log(f"SKIP: selected market is not live yet (starts {start_utc.isoformat()})", force=True)
         append_journal({"type": "skip", "reason": "market_not_live_yet", "question": best["question"], "slug": best["slug"]})
