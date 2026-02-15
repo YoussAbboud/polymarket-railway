@@ -213,35 +213,31 @@ def load_config():
 # Market discovery
 # -----------------------
 def parse_fast_market_window_utc(question: str):
-    """
-    Parses:
-      "Bitcoin Up or Down - February 16, 2:55PM-3:00PM ET"
-    Returns (start_utc, end_utc) as timezone-aware UTC datetimes.
-    Assumes ET = UTC-5 (your existing heuristic).
-    """
     import re
     q = question or ""
-
-    m = re.search(r"([A-Za-z]+ \d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
+    m = re.search(
+        r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET",
+        q
+    )
     if not m:
         return None
 
     try:
-        date_str = m.group(1)      # "February 16"
-        start_str = m.group(2)     # "2:55PM"
-        end_str = m.group(3)       # "3:00PM"
         year = now_utc().year
+        month = m.group(1)
+        day = int(m.group(2))
+        t1 = m.group(3)
+        t2 = m.group(4)
 
-        start_et = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
-        end_et   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
+        ET = timezone(timedelta(hours=-5))  # EST
 
-        # ET -> UTC (+5h) per your existing logic
-        start_utc = start_et.replace(tzinfo=timezone.utc) + timedelta(hours=5)
-        end_utc   = end_et.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        start_et = datetime.strptime(f"{month} {day} {year} {t1}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
+        end_et   = datetime.strptime(f"{month} {day} {year} {t2}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
 
-        return start_utc, end_utc
+        return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
     except Exception:
         return None
+
 
 
 
@@ -254,56 +250,51 @@ def discover_fast_markets(asset: str, window: str):
 
     out = []
     for m in result:
-        q = (m.get("question") or "")
-        ql = q.lower()
+        q = (m.get("question") or "").lower()
         slug = (m.get("slug") or "")
 
         if f"-{window}-" not in slug:
             continue
-        if not any(p in ql for p in patterns):
+        if not any(p in q for p in patterns):
             continue
         if m.get("closed"):
             continue
 
-        start_dt, end_dt = gamma_market_window(m)
+        start, end = gamma_market_window(m)
+
+        # ✅ HARD FILTER: only CURRENTLY LIVE windows
+        if not is_live_window(start, end, grace_s=20):
+            continue
+
         out.append({
-            "question": q,
+            "question": m.get("question", ""),
             "slug": slug,
-            "start_time": start_dt,
-            "end_time": end_dt,
+            "start_time": start,
+            "end_time": end,
             "outcome_prices": m.get("outcomePrices", "[]"),
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
-            "accepting_orders": m.get("acceptingOrders", None),
-            "active": m.get("active", None),
         })
+
     return out
+
 
 
 
 def select_best_market(markets, min_time_remaining: int):
     now = now_utc()
     candidates = []
-
     for m in markets:
-        start = m.get("start_time")
         end = m.get("end_time")
-        if not start or not end:
+        if not end:
             continue
-
-        # Only markets that have started (or are about to start in the next 30s)
-        if start > now + timedelta(seconds=30):
-            continue
-
         remaining = (end - now).total_seconds()
-        if remaining > min_time_remaining:
+        if remaining >= min_time_remaining:
             candidates.append((remaining, m))
-
     if not candidates:
         return None
-
-    # choose the one that ends soonest (your original logic)
-    candidates.sort(key=lambda x: x[0])
+    candidates.sort(key=lambda x: x[0])  # soonest expiring live window
     return candidates[0][1]
+
 
 
 def parse_iso_dt(s: str):
@@ -317,34 +308,67 @@ def parse_iso_dt(s: str):
         return None
 
 
+def parse_iso_dt(s):
+    if not s:
+        return None
+    try:
+        # Handles "2026-02-15T19:30:00Z" and "+00:00"
+        s = str(s).replace("Z", "+00:00")
+        return datetime.fromisoformat(s).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_ts_any(v):
+    """
+    Accepts numeric seconds, numeric ms, or numeric strings.
+    Returns UTC datetime or None.
+    """
+    if v is None:
+        return None
+    try:
+        # If it's already a datetime
+        if isinstance(v, datetime):
+            return v.astimezone(timezone.utc)
+
+        # ISO string?
+        iso = parse_iso_dt(v)
+        if iso:
+            return iso
+
+        # numeric string/number
+        ts = float(v)
+        if ts > 1e12:  # ms
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
 def gamma_market_window(m: dict):
     # Prefer ISO fields if present
     start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
-    end = parse_iso_dt(m.get("endDateIso")) or parse_iso_dt(m.get("end_date_iso"))
+    end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
 
-    # Fallback: numeric fields (sometimes ms)
-    if not start and m.get("startDate"):
-        ts = float(m["startDate"])
-        if ts > 1e12:  # ms
-            ts /= 1000.0
-        start = datetime.fromtimestamp(ts, tz=timezone.utc)
-
-    if not end and m.get("endDate"):
-        ts = float(m["endDate"])
-        if ts > 1e12:  # ms
-            ts /= 1000.0
-        end = datetime.fromtimestamp(ts, tz=timezone.utc)
+    # Fallback: numeric/strings fields
+    if not start:
+        start = parse_ts_any(m.get("startDate") or m.get("start_date"))
+    if not end:
+        end = parse_ts_any(m.get("endDate") or m.get("end_date"))
 
     return start, end
 
-def is_future_market(question: str) -> bool:
-    start, end = parse_fast_market_window_utc(question or "")
+def is_live_window(start: datetime, end: datetime, *, grace_s=20) -> bool:
     if not start or not end:
         return False
-    # If market starts more than 2 minutes from now, treat as "future"
-    return start > (now_utc() + timedelta(minutes=2))
+    now = now_utc()
+    # allow a small grace before/after
+    return (start - timedelta(seconds=grace_s)) <= now <= (end + timedelta(seconds=grace_s))
 
-
+def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
+    if not end:
+        return False
+    return (end - now_utc()).total_seconds() >= min_seconds_left
 
 # -----------------------
 # Signal
@@ -431,32 +455,26 @@ def import_market(api_key: str, slug: str):
 
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
-    """
-    BUY  -> send amount (USDC)
-    SELL -> send shares
-    """
-    data = {
+    payload = {
         "market_id": market_id,
         "side": side,
         "venue": "polymarket",
         "source": TRADE_SOURCE,
+        "action": action,  # "buy" or "sell"
     }
-
     if action == "sell":
-        # ✅ Simmer requires shares for sell orders
-        data["action"] = "sell"
-        data["shares"] = float(shares or 0)
+        payload["shares"] = float(shares or 0)
     else:
-        data["action"] = "buy"
-        data["amount"] = float(amount or 0)
+        payload["amount"] = float(amount or 0)
 
     return simmer_request(
         "/api/sdk/trade",
         method="POST",
-        data=data,
+        data=payload,
         api_key=api_key,
         timeout=60,
     )
+
 
 
 
@@ -473,38 +491,70 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
     return min(max_size, bal * smart_pct)
 
 def close_future_positions(api_key: str, positions):
+    """
+    Close positions that are NOT appropriate to hold right now:
+    - future windows (start > now + 2m)
+    - expired windows (end < now - small grace)
+    Uses question parsing fallback (ET heuristic).
+    """
     closed_any = False
+    now = now_utc()
 
-    for p in positions:
-        q = p.get("question") or ""
+    for p in positions or []:
+        q = (p.get("question") or "").strip()
         if "up or down" not in q.lower():
             continue
 
-        if not is_future_market(q):
+        win = parse_fast_market_window_utc(q)
+        if not win:
+            append_journal({"type": "warn", "reason": "cannot_parse_window", "question": q})
             continue
+
+        start_utc, end_utc = win
+
+        # classify
+        is_future = start_utc > (now + timedelta(minutes=2))
+        is_expired = end_utc < (now - timedelta(seconds=30))
+
+        if not (is_future or is_expired):
+            continue  # keep live/near-live positions
 
         market_id = p.get("market_id") or p.get("id") or p.get("marketId")
         if not market_id:
-            append_journal({"type":"warn","reason":"no_market_id_to_close","question":q})
+            append_journal({"type": "warn", "reason": "no_market_id_to_close", "question": q})
             continue
 
         shares_yes = float(p.get("shares_yes", 0) or 0)
         shares_no  = float(p.get("shares_no", 0) or 0)
 
-        # We sell the side we hold
+        # SELL requires shares, not amount
         if shares_yes > 0:
-            res = execute_trade(api_key, market_id, "yes", amount=float(min(shares_yes, shares_yes)), action="sell")
-            append_journal({"type":"close_attempt","side":"sell_yes","market_id":market_id,"question":q,"result":res})
+            res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+            append_journal({
+                "type": "close_attempt",
+                "why": "future" if is_future else "expired",
+                "side": "sell_yes",
+                "market_id": market_id,
+                "question": q,
+                "shares": shares_yes,
+                "result": res
+            })
             closed_any = True
 
         if shares_no > 0:
-            res = execute_trade(api_key, market_id, "no", amount=float(min(shares_no, shares_no)), action="sell")
-            append_journal({"type":"close_attempt","side":"sell_no","market_id":market_id,"question":q,"result":res})
+            res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
+            append_journal({
+                "type": "close_attempt",
+                "why": "future" if is_future else "expired",
+                "side": "sell_no",
+                "market_id": market_id,
+                "question": q,
+                "shares": shares_no,
+                "result": res
+            })
             closed_any = True
 
     return closed_any
-
-
 
 # -----------------------
 # Risk + state
