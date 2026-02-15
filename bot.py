@@ -683,8 +683,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         # refresh positions after closing
         positions = get_positions(api_key)
 
-    active_slugs = active_fast_market_slugs(cfg["asset"], cfg["window"])
-    open_fast = count_open_fast_positions(positions, active_slugs)
+    open_fast = count_open_fast_positions(positions)
     if open_fast >= int(cfg["max_open_fast_positions"]):
         log(f"SKIP: open fast positions ({open_fast}) >= cap ({cfg['max_open_fast_positions']})", force=True)
         append_journal({"type": "skip", "reason": "max_open_positions", "open_fast": open_fast})
