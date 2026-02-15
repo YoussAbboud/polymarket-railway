@@ -462,9 +462,9 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     # signal
     symbol = ASSET_SYMBOLS.get(cfg["asset"], "BTCUSDT")
     sig = get_binance_momentum(symbol, int(cfg["lookback_minutes"]))
-    if not sig:
-        log("SKIP: signal fetch failed", force=True)
-        append_journal({"type": "skip", "reason": "signal_fetch_failed"})
+    if not sig or (isinstance(sig, dict) and sig.get("error")):
+        log(f"SKIP: signal fetch failed | {sig}", force=True)
+        append_journal({"type": "skip", "reason": "signal_fetch_failed", "detail": sig})
         return
 
     mom_abs = abs(sig["momentum_pct"])
