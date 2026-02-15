@@ -244,42 +244,47 @@ def parse_fast_market_window_utc(question: str):
 
 def discover_fast_markets(asset: str, window: str):
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
+
+    print(f"DEBUG: gamma fetch -> {GAMMA_MARKETS_URL}")
     result = api_request(GAMMA_MARKETS_URL)
+    print(f"DEBUG: gamma result type={type(result).__name__}")
+
+    # If Gamma errored, print it (don’t silently return [])
     if not isinstance(result, list):
+        print("DEBUG: gamma non-list response:", str(result)[:500])
         return []
 
+    print(f"DEBUG: gamma markets returned={len(result)}")
+
+    rejected = {"slug": 0, "pattern": 0, "closed": 0, "no_window": 0, "not_live": 0}
     out = []
+
     for m in result:
-        q = (m.get("question") or "").lower()
+        q_raw = (m.get("question") or "")
+        q = q_raw.lower()
         slug = (m.get("slug") or "")
 
         if f"-{window}-" not in slug:
+            rejected["slug"] += 1
             continue
         if not any(p in q for p in patterns):
+            rejected["pattern"] += 1
             continue
         if m.get("closed"):
+            rejected["closed"] += 1
             continue
 
         start, end = gamma_market_window(m)
-
-        # MUST have a usable window
         if not start or not end:
+            rejected["no_window"] += 1
             continue
 
-        # Optional sanity: window duration must roughly match cfg window
-        expected = {"1m": 60, "3m": 180, "5m": 300, "15m": 900}.get(window)
-        if expected:
-            dur = (end - start).total_seconds()
-            if dur < expected - 90 or dur > expected + 90:
-                continue
-
-
-        # ✅ HARD FILTER: only CURRENTLY LIVE windows
         if not is_live_window(start, end, grace_s=20):
+            rejected["not_live"] += 1
             continue
 
         out.append({
-            "question": m.get("question", ""),
+            "question": q_raw,
             "slug": slug,
             "start_time": start,
             "end_time": end,
@@ -287,7 +292,10 @@ def discover_fast_markets(asset: str, window: str):
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
         })
 
+    print("DEBUG: gamma rejected:", rejected)
+    print(f"DEBUG: gamma live markets matched={len(out)}")
     return out
+
 
 
 
@@ -674,6 +682,9 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
 
     api_key = get_api_key()
     st = load_state()
+
+    run_id = now_utc().isoformat()
+    print(f"DEBUG RUN_ID={run_id}")
 
     if os.environ.get("TRADING_ENABLED", "true").lower() not in ("true", "1", "yes"):
         log("SKIP: TRADING_ENABLED is false", force=True)
