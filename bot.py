@@ -713,8 +713,8 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             return
 
     if int(st.get("trades", 0)) >= int(cfg["daily_trade_limit"]):
-        log(f"SKIP: daily trade limit hit ({st['trades']}/{cfg['daily_trade_limit']})", force=True)
-        append_journal({"type": "skip", "reason": "daily_trade_limit", "trades": st["trades"]})
+        log("SKIP: no active fast markets", force=True)
+        append_journal({"type": "skip", "reason": "no_markets"})
         return
 
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
@@ -724,6 +724,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
+    if not best:
+        og("SKIP: no market with enough time remaining", force=True)
+        append_journal({"type": "skip", "reason": "no_best_market"})
+        return
+    
     win = parse_fast_market_window_utc(best.get("question", ""))
     if not win:
         log("SKIP: couldn't parse market window from question", force=True)
