@@ -81,7 +81,7 @@ def append_journal(event: dict):
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def api_request(url, method="GET", data=None, headers=None, timeout=15):
+def api_request(url, method="GET", data=None, headers=None, timeout=45):
     try:
         req_headers = headers or {}
         req_headers.setdefault("User-Agent", "railway-fastloop/1.0")
