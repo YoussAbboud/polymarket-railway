@@ -580,7 +580,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
-    if os.environ.get("TRADING_ENABLED", "false").lower() not in ("true", "1", "yes"):
+    if os.environ.get("TRADING_ENABLED", "true").lower() not in ("true", "1", "yes"):
         log("SKIP: TRADING_ENABLED is false", force=True)
         append_journal({"type": "skip", "reason": "trading_disabled"})
         return
