@@ -250,45 +250,25 @@ def parse_fast_market_window_utc(question: str):
 
 def discover_fast_markets(asset: str, window: str):
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
-
-    print(f"DEBUG: gamma fetch -> {GAMMA_MARKETS_URL}")
     result = api_request(GAMMA_MARKETS_URL)
     if not isinstance(result, list):
         return []
 
-    rejected = {"slug": 0, "pattern": 0, "closed": 0, "no_window": 0, "not_live": 0, "too_close": 0, "bad_times": 0}
     out = []
-
     for m in result:
         q_raw = (m.get("question") or "")
         q = q_raw.lower()
         slug = (m.get("slug") or "")
 
-        if f"-{window}-" not in slug:
-            rejected["no_window"] += 1
-            continue
         if not any(p in q for p in patterns):
-            rejected["pattern"] += 1
             continue
         if m.get("closed"):
-            rejected["closed"] += 1
             continue
 
-        # ✅ SOURCE OF TRUTH: parse window from QUESTION first
-        win = parse_fast_market_window_utc(q_raw)
-        if win:
-            start, end = win
-        else:
-            # fallback only if parsing fails
-            start, end = gamma_market_window(m)
+        start, end = gamma_market_window(m)
 
-        if not start or not end:
-            rejected["bad_times"] += 1
-            continue
-
-        # ✅ HARD FILTER: must be live NOW
+        # ✅ ONLY CURRENTLY LIVE windows
         if not is_live_window(start, end, grace_s=20):
-            rejected["not_live"] += 1
             continue
 
         out.append({
@@ -300,33 +280,30 @@ def discover_fast_markets(asset: str, window: str):
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
         })
 
-    print("DEBUG: gamma result type=list")
-    print(f"DEBUG: gamma markets returned={len(result)}")
-    print(f"DEBUG: gamma rejected: {rejected}")
-    print(f"DEBUG: gamma live markets matched={len(out)}")
-
     return out
 
 
 
+
+
 def select_best_market(markets, min_seconds_left: int):
+    now = now_utc()
     live = []
     for m in markets:
-        start = m.get("start_time")
         end = m.get("end_time")
-
-        if not is_live_window(start, end):          # ✅ filter out future/expired
+        if not end:
             continue
-        if not has_time_remaining(end, min_seconds_left):  # ✅ filter out “too close”
+        left = (end - now).total_seconds()
+        if left < min_seconds_left:
             continue
-
-        # pick soonest expiring among valid
-        live.append(((end - now_utc()).total_seconds(), m))
+        live.append((left, m))
 
     if not live:
         return None
-    live.sort(key=lambda x: x[0])
+
+    live.sort(key=lambda x: x[0])  # soonest ending = current window
     return live[0][1]
+
 
 
 
