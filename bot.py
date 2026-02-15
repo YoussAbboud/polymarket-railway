@@ -271,6 +271,12 @@ def select_best_market(markets, min_time_remaining: int):
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
 
+def is_market_expired(question: str) -> bool:
+    end = parse_fast_market_end_time(question or "")
+    if not end:
+        return False  # if we can't parse, treat as active to be safe
+    return end <= now_utc()
+
 
 # -----------------------
 # Signal
@@ -404,9 +410,12 @@ def save_state(st: dict):
 def count_open_fast_positions(positions):
     n = 0
     for p in positions:
-        q = (p.get("question") or "").lower()
-        if "up or down" not in q:
+        q = (p.get("question") or "")
+        ql = q.lower()
+        if "up or down" not in ql:
             continue
+        if is_market_expired(q):
+            continue  # ✅ don't count expired
         yes = float(p.get("shares_yes", 0) or 0)
         no = float(p.get("shares_no", 0) or 0)
         if yes > 0 or no > 0:
@@ -416,7 +425,10 @@ def count_open_fast_positions(positions):
 
 def already_in_this_market(positions, question: str):
     for p in positions:
-        if (p.get("question") or "") == (question or ""):
+        pq = (p.get("question") or "")
+        if pq == (question or ""):
+            if is_market_expired(pq):
+                return False  # ✅ expired position shouldn't block new trades
             yes = float(p.get("shares_yes", 0) or 0)
             no = float(p.get("shares_no", 0) or 0)
             if yes > 0 or no > 0:
