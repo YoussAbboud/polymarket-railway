@@ -212,21 +212,48 @@ def load_config():
 # -----------------------
 # Market discovery
 # -----------------------
-def parse_fast_market_end_time(question: str):
+def parse_fast_market_window_utc(question: str):
+    """
+    Parse: "Bitcoin Up or Down - February 16, 2:55PM-3:00PM ET"
+    Return (start_utc, end_utc) as timezone-aware UTC datetimes, or (None, None).
+    Assumes ET = America/New_York (handles DST properly if zoneinfo exists).
+    """
     import re
-    pattern = r"(\w+ \d+),.*?-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET"
-    m = re.search(pattern, question or "")
-    if not m:
-        return None
     try:
-        date_str = m.group(1)
-        time_str = m.group(2)
-        year = now_utc().year
-        dt_str = f"{date_str} {year} {time_str}"
-        dt = datetime.strptime(dt_str, "%B %d %Y %I:%M%p")
-        return dt.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
     except Exception:
-        return None
+        et = None  # fallback below
+
+    q = question or ""
+    m = re.search(r"([A-Za-z]+ \d+),\s*(\d{1,2}:\d{2}(?:AM|PM))\s*-\s*(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
+    if not m:
+        return None, None
+
+    date_str = m.group(1)   # "February 16"
+    start_str = m.group(2)  # "2:55PM"
+    end_str = m.group(3)    # "3:00PM"
+
+    # Use current year, but we will later filter to "today" in ET to avoid tomorrow picks.
+    year = now_utc().year
+
+    try:
+        start_local = datetime.strptime(f"{date_str} {year} {start_str}", "%B %d %Y %I:%M%p")
+        end_local   = datetime.strptime(f"{date_str} {year} {end_str}", "%B %d %Y %I:%M%p")
+
+        if et:
+            start_local = start_local.replace(tzinfo=et)
+            end_local = end_local.replace(tzinfo=et)
+            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+        # Fallback: ET approx. (better than your +5 hardcode but still imperfect in DST)
+        # If you can't use zoneinfo, keep your old assumption:
+        start_utc = start_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        end_utc = end_local.replace(tzinfo=timezone.utc) + timedelta(hours=5)
+        return start_utc, end_utc
+    except Exception:
+        return None, None
+
 
 
 def discover_fast_markets(asset: str, window: str):
@@ -244,11 +271,13 @@ def discover_fast_markets(asset: str, window: str):
             continue
         if m.get("closed"):
             continue
+        start_utc, end_utc = parse_fast_market_window_utc(m.get("question", ""))
         out.append(
             {
                 "question": m.get("question", ""),
                 "slug": slug,
-                "end_time": parse_fast_market_end_time(m.get("question", "")),
+                "start_time": start_utc,
+                "end_time": end_utc,
                 "outcome_prices": m.get("outcomePrices", "[]"),
                 "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
             }
@@ -258,24 +287,42 @@ def discover_fast_markets(asset: str, window: str):
 
 def select_best_market(markets, min_time_remaining: int):
     now = now_utc()
+
+    # allow entering slightly before the window starts, and slightly after it ends
+    lead_seconds = 20        # can enter up to 20s before start
+    grace_seconds = 60       # still consider it live up to 60s after end (market may stay tradable)
+
     candidates = []
     for m in markets:
+        start = m.get("start_time")
         end = m.get("end_time")
-        if not end:
+        if not start or not end:
             continue
+
+        # ✅ must be today's window (prevents picking Feb 16 when it's Feb 15)
+        # We enforce "same UTC date as now" as a simple guard.
+        # (If you want ET-day specifically, we can tighten it.)
+        if start.date() != now.date():
+            continue
+
+        # ✅ only consider live-ish window
+        if now < (start - timedelta(seconds=lead_seconds)):
+            continue
+        if now > (end + timedelta(seconds=grace_seconds)):
+            continue
+
         remaining = (end - now).total_seconds()
-        if remaining > min_time_remaining:
-            candidates.append((remaining, m))
+        if remaining < min_time_remaining:
+            continue
+
+        candidates.append((remaining, m))
+
     if not candidates:
         return None
+
+    # choose the one ending soonest (current window)
     candidates.sort(key=lambda x: x[0])
     return candidates[0][1]
-
-def is_market_expired(question: str) -> bool:
-    end = parse_fast_market_end_time(question or "")
-    if not end:
-        return False  # if we can't parse, treat as active to be safe
-    return end <= now_utc()
 
 
 # -----------------------
