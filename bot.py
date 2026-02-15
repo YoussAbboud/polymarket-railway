@@ -450,8 +450,12 @@ def import_market(api_key: str, slug: str):
 
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float, action: str = "buy"):
-    # side: "yes" or "no"
-    # action: "buy" or "sell"
+    """
+    action: "buy" or "sell"
+    side: "yes" or "no"
+    amount: for buys, we already use USDC.
+            for sells, Simmer might accept shares OR USDC. We'll try both in close_future_positions().
+    """
     return simmer_request(
         "/api/sdk/trade",
         method="POST",
@@ -459,13 +463,14 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float, action
             "market_id": market_id,
             "side": side,
             "amount": amount,
-            "action": action,          # ✅ IMPORTANT
+            "action": action,       # ✅
             "venue": "polymarket",
             "source": TRADE_SOURCE,
         },
         api_key=api_key,
-        timeout=60
+        timeout=60,
     )
+
 
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
@@ -530,25 +535,44 @@ def save_state(st: dict):
     save_json(STATE_PATH, st)
 
 
-def count_open_fast_positions(positions, active_slugs: set):
+def _parse_iso_utc(dt_str: str):
+    if not dt_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        # Simmer gives naive ISO (no tz). Treat as UTC.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def is_future_position(p: dict) -> bool:
+    # If it resolves more than ~30 minutes from now, it's not a current 5m market.
+    resolves = _parse_iso_utc(p.get("resolves_at"))
+    if not resolves:
+        return False
+    return resolves > (now_utc() + timedelta(minutes=30))
+
+
+def count_open_fast_positions(positions):
     n = 0
     for p in positions:
-        yes = float(p.get("shares_yes", 0) or 0)
-        no = float(p.get("shares_no", 0) or 0)
-        if yes <= 0 and no <= 0:
+        ql = (p.get("question") or "").lower()
+        if "up or down" not in ql:
             continue
 
-        # Try to match the position to a slug / URL if Simmer provides it
-        slug = (p.get("slug") or p.get("market_slug") or "")
-        url = (p.get("market_url") or p.get("url") or "")
-        if not slug and "/event/" in url:
-            slug = url.split("/event/")[-1].split("?")[0].strip("/")
+        # ✅ ignore wrong/future positions
+        if is_future_position(p):
+            continue
 
-        # ✅ Only count it if it’s one of the currently active fast markets
-        if slug and slug in active_slugs:
+        yes = float(p.get("shares_yes", 0) or 0)
+        no = float(p.get("shares_no", 0) or 0)
+        if yes > 0 or no > 0:
             n += 1
-
     return n
+
 
 
 
@@ -572,6 +596,66 @@ def active_fast_market_slugs(asset: str, window: str):
 # -----------------------
 # Main cycle
 # -----------------------
+def close_future_positions(api_key: str, positions, quiet: bool = False):
+    def log(msg):
+        if not quiet:
+            print(msg)
+
+    closed_any = False
+    for p in positions:
+        q = p.get("question") or ""
+        if "up or down" not in q.lower():
+            continue
+
+        if not is_future_position(p):
+            continue
+
+        market_id = p.get("market_id")
+        if not market_id:
+            append_journal({"type": "warn", "reason": "no_market_id_to_close", "question": q})
+            continue
+
+        shares_yes = float(p.get("shares_yes", 0) or 0)
+        shares_no = float(p.get("shares_no", 0) or 0)
+        cur_val = float(p.get("current_value", 0) or 0)
+
+        log(f"AUTO-CLOSE: future position detected | resolves_at={p.get('resolves_at')} | {q}")
+
+        # We try SELL using shares first (most likely),
+        # then fallback to selling by USDC value if shares-mode isn't accepted.
+        def try_sell(side: str, shares: float):
+            nonlocal closed_any
+            if shares <= 0:
+                return
+
+            # Attempt 1: amount = shares
+            r1 = execute_trade(api_key, market_id, side, amount=float(shares), action="sell")
+            append_journal({"type": "close_attempt", "mode": "shares", "side": side, "shares": shares, "market_id": market_id, "question": q, "result": r1})
+
+            if isinstance(r1, dict) and r1.get("success"):
+                log(f"AUTO-CLOSE: SELL_{side.upper()} success (shares)")
+                closed_any = True
+                return
+
+            # Attempt 2: amount = current_value (USDC)
+            # Only do this if we have a value > 0
+            if cur_val > 0:
+                r2 = execute_trade(api_key, market_id, side, amount=float(cur_val), action="sell")
+                append_journal({"type": "close_attempt", "mode": "usdc", "side": side, "amount_usdc": cur_val, "market_id": market_id, "question": q, "result": r2})
+
+                if isinstance(r2, dict) and r2.get("success"):
+                    log(f"AUTO-CLOSE: SELL_{side.upper()} success (usdc)")
+                    closed_any = True
+
+        if shares_yes > 0:
+            try_sell("yes", shares_yes)
+
+        if shares_no > 0:
+            try_sell("no", shares_no)
+
+    return closed_any
+
+
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
         if not quiet or force:
@@ -593,7 +677,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     else:
         print("DEBUG: no positions returned")
 
-    closed_any = close_future_positions(api_key, positions)
+    closed_any = close_future_positions(api_key, positions, quiet=quiet)
     if closed_any:
         print("INFO: attempted to close future positions")
         # refresh positions after closing
@@ -626,6 +710,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
+    start_utc, end_utc = parse_fast_market_window_utc(best["question"])
+    if start_utc and start_utc > now_utc() + timedelta(minutes=2):
+        log(f"SKIP: selected market is not live yet (starts {start_utc.isoformat()})", force=True)
+        append_journal({"type": "skip", "reason": "market_not_live_yet", "question": best["question"], "slug": best["slug"]})
+        return
     if not best:
         log("SKIP: no market with enough time remaining")
         append_journal({"type": "skip", "reason": "too_close_to_expiry"})
