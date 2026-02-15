@@ -692,6 +692,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     print("DEBUG: running close_future_positions() now...")
     closed_any = close_future_positions(api_key, positions, quiet=quiet)
     print(f"DEBUG: close_future_positions returned {closed_any}")
+
+    print("DEBUG: after close_future_positions, continuing…")
+    print(f"DEBUG: state trades={st.get('trades')} day={st.get('day')} last_trade_ts={st.get('last_trade_ts')}")
+    print(f"DEBUG: cfg daily_trade_limit={cfg['daily_trade_limit']} cooldown={cfg['cooldown_seconds']} cap={cfg['max_open_fast_positions']}")
+
     if closed_any:
         print("INFO: attempted to close future positions")
         # refresh positions after closing
@@ -713,11 +718,13 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             return
 
     if int(st.get("trades", 0)) >= int(cfg["daily_trade_limit"]):
-        log("SKIP: no active fast markets", force=True)
-        append_journal({"type": "skip", "reason": "no_markets"})
+        log(f"SKIP: daily trade limit reached ({st.get('trades')} >= {cfg['daily_trade_limit']})", force=True)
+        append_journal({"type": "skip", "reason": "daily_trade_limit", "trades": st.get("trades")})
         return
 
+
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
+    print("DEBUG: starting market discovery…")
     if not markets:
         log("SKIP: no active fast markets")
         append_journal({"type": "skip", "reason": "no_markets"})
