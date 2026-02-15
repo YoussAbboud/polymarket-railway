@@ -549,11 +549,13 @@ def _parse_iso_utc(dt_str: str):
 
 
 def is_future_position(p: dict) -> bool:
-    # If it resolves more than ~30 minutes from now, it's not a current 5m market.
     resolves = _parse_iso_utc(p.get("resolves_at"))
     if not resolves:
         return False
-    return resolves > (now_utc() + timedelta(minutes=30))
+
+    # If it resolves on a different UTC date than now, it's not the current fast window
+    return resolves.date() != now_utc().date()
+
 
 
 def count_open_fast_positions(positions):
@@ -625,6 +627,18 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
         # then fallback to selling by USDC value if shares-mode isn't accepted.
         def try_sell(side: str, shares: float):
             nonlocal closed_any
+
+            # ✅ ADD THESE PRINTS HERE
+            print(
+                f"AUTO-CLOSE: attempting close | market_id={market_id} | side={side} "
+                f"| shares={shares} | value={cur_val} | resolves_at={p.get('resolves_at')}"
+            )
+
+            r1 = execute_trade(api_key, market_id, side, amount=float(shares), action="sell")
+            print(f"AUTO-CLOSE response (sell {side}, shares):", r1)
+
+            # keep your existing journal logic / success checks here...
+
             if shares <= 0:
                 return
 
