@@ -449,27 +449,34 @@ def import_market(api_key: str, slug: str):
     return None, f"unexpected import status: {status}"
 
 
-def execute_trade(api_key: str, market_id: str, side: str, amount: float, action: str = "buy"):
+def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     """
-    action: "buy" or "sell"
-    side: "yes" or "no"
-    amount: for buys, we already use USDC.
-            for sells, Simmer might accept shares OR USDC. We'll try both in close_future_positions().
+    BUY  -> send amount (USDC)
+    SELL -> send shares
     """
+    data = {
+        "market_id": market_id,
+        "side": side,
+        "venue": "polymarket",
+        "source": TRADE_SOURCE,
+    }
+
+    if action == "sell":
+        # ✅ Simmer requires shares for sell orders
+        data["action"] = "sell"
+        data["shares"] = float(shares or 0)
+    else:
+        data["action"] = "buy"
+        data["amount"] = float(amount or 0)
+
     return simmer_request(
         "/api/sdk/trade",
         method="POST",
-        data={
-            "market_id": market_id,
-            "side": side,
-            "amount": amount,
-            "action": action,       # ✅
-            "venue": "polymarket",
-            "source": TRADE_SOURCE,
-        },
+        data=data,
         api_key=api_key,
         timeout=60,
     )
+
 
 
 
@@ -634,7 +641,7 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
                 f"| shares={shares} | value={cur_val} | resolves_at={p.get('resolves_at')}"
             )
 
-            r1 = execute_trade(api_key, market_id, side, amount=float(shares), action="sell")
+            r1 = execute_trade(api_key, market_id, side, shares=float(shares), action="sell")
             print(f"AUTO-CLOSE response (sell {side}, shares):", r1)
 
             # keep your existing journal logic / success checks here...
@@ -643,7 +650,7 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
                 return
 
             # Attempt 1: amount = shares
-            r1 = execute_trade(api_key, market_id, side, amount=float(shares), action="sell")
+            r1 = execute_trade(api_key, market_id, side, shares=float(shares), action="sell")
             append_journal({"type": "close_attempt", "mode": "shares", "side": side, "shares": shares, "market_id": market_id, "question": q, "result": r1})
 
             if isinstance(r1, dict) and r1.get("success"):
