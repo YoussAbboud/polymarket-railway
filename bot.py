@@ -253,6 +253,7 @@ def discover_fast_markets(asset: str, window: str):
         return []
     out = []
     for m in result:
+        print("DEBUG gamma market keys:", list(m.keys()))
         q = (m.get("question") or "").lower()
         slug = m.get("slug", "") or ""
         if f"-{window}-" not in slug:
