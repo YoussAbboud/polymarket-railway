@@ -12,7 +12,7 @@
   "max_position": 3.0,
   "smart_sizing_pct": 0.05,
 
-  "max_open_fast_positions": 1,
+  "max_open_fast_positions": 2,
   "cooldown_seconds": 180,
   "daily_trade_limit": 10,
 

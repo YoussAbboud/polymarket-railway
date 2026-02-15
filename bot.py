@@ -407,23 +407,26 @@ def save_state(st: dict):
     save_json(STATE_PATH, st)
 
 
-def count_open_fast_positions(positions):
+def count_open_fast_positions(positions, active_slugs: set):
     n = 0
     for p in positions:
-        q = (p.get("question") or "")
-        ql = q.lower()
-        if "up or down" not in ql:
-            continue
-
-        # ✅ ignore expired windows
-        if is_market_expired(q):
-            continue
-
         yes = float(p.get("shares_yes", 0) or 0)
         no = float(p.get("shares_no", 0) or 0)
-        if yes > 0 or no > 0:
+        if yes <= 0 and no <= 0:
+            continue
+
+        # Try to match the position to a slug / URL if Simmer provides it
+        slug = (p.get("slug") or p.get("market_slug") or "")
+        url = (p.get("market_url") or p.get("url") or "")
+        if not slug and "/event/" in url:
+            slug = url.split("/event/")[-1].split("?")[0].strip("/")
+
+        # ✅ Only count it if it’s one of the currently active fast markets
+        if slug and slug in active_slugs:
             n += 1
+
     return n
+
 
 
 
@@ -439,6 +442,9 @@ def already_in_this_market(positions, question: str):
                 return True
     return False
 
+def active_fast_market_slugs(asset: str, window: str):
+    markets = discover_fast_markets(asset, window)
+    return set(m["slug"] for m in markets if m.get("slug"))
 
 # -----------------------
 # Main cycle
@@ -457,7 +463,8 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     positions = get_positions(api_key)
-    open_fast = count_open_fast_positions(positions)
+    active_slugs = active_fast_market_slugs(cfg["asset"], cfg["window"])
+    open_fast = count_open_fast_positions(positions, active_slugs)
     if open_fast >= int(cfg["max_open_fast_positions"]):
         log(f"SKIP: open fast positions ({open_fast}) >= cap ({cfg['max_open_fast_positions']})", force=True)
         append_journal({"type": "skip", "reason": "max_open_positions", "open_fast": open_fast})
