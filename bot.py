@@ -213,8 +213,16 @@ def load_config():
 # Market discovery
 # -----------------------
 def parse_fast_market_window_utc(question: str):
+    """
+    Parses:
+      "Bitcoin Up or Down - February 16, 3:45PM-3:50PM ET"
+    Returns (start_utc, end_utc) timezone-aware UTC datetimes.
+    Uses America/New_York so DST is handled (EST/EDT).
+    """
     import re
-    q = question or ""
+    from zoneinfo import ZoneInfo
+
+    q = (question or "").strip()
     m = re.search(
         r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET",
         q
@@ -229,16 +237,14 @@ def parse_fast_market_window_utc(question: str):
         t1 = m.group(3)
         t2 = m.group(4)
 
-        ET = timezone(timedelta(hours=-5))  # EST
+        ny = ZoneInfo("America/New_York")
 
-        start_et = datetime.strptime(f"{month} {day} {year} {t1}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
-        end_et   = datetime.strptime(f"{month} {day} {year} {t2}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
+        start_local = datetime.strptime(f"{month} {day} {year} {t1}", "%B %d %Y %I:%M%p").replace(tzinfo=ny)
+        end_local   = datetime.strptime(f"{month} {day} {year} {t2}", "%B %d %Y %I:%M%p").replace(tzinfo=ny)
 
-        return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
     except Exception:
         return None
-
-
 
 
 
@@ -247,16 +253,10 @@ def discover_fast_markets(asset: str, window: str):
 
     print(f"DEBUG: gamma fetch -> {GAMMA_MARKETS_URL}")
     result = api_request(GAMMA_MARKETS_URL)
-    print(f"DEBUG: gamma result type={type(result).__name__}")
-
-    # If Gamma errored, print it (don’t silently return [])
     if not isinstance(result, list):
-        print("DEBUG: gamma non-list response:", str(result)[:500])
         return []
 
-    print(f"DEBUG: gamma markets returned={len(result)}")
-
-    rejected = {"slug": 0, "pattern": 0, "closed": 0, "no_window": 0, "not_live": 0}
+    rejected = {"slug": 0, "pattern": 0, "closed": 0, "no_window": 0, "not_live": 0, "too_close": 0, "bad_times": 0}
     out = []
 
     for m in result:
@@ -265,7 +265,7 @@ def discover_fast_markets(asset: str, window: str):
         slug = (m.get("slug") or "")
 
         if f"-{window}-" not in slug:
-            rejected["slug"] += 1
+            rejected["no_window"] += 1
             continue
         if not any(p in q for p in patterns):
             rejected["pattern"] += 1
@@ -274,11 +274,19 @@ def discover_fast_markets(asset: str, window: str):
             rejected["closed"] += 1
             continue
 
-        start, end = gamma_market_window(m)
+        # ✅ SOURCE OF TRUTH: parse window from QUESTION first
+        win = parse_fast_market_window_utc(q_raw)
+        if win:
+            start, end = win
+        else:
+            # fallback only if parsing fails
+            start, end = gamma_market_window(m)
+
         if not start or not end:
-            rejected["no_window"] += 1
+            rejected["bad_times"] += 1
             continue
 
+        # ✅ HARD FILTER: must be live NOW
         if not is_live_window(start, end, grace_s=20):
             rejected["not_live"] += 1
             continue
@@ -292,11 +300,12 @@ def discover_fast_markets(asset: str, window: str):
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
         })
 
-    print("DEBUG: gamma rejected:", rejected)
+    print("DEBUG: gamma result type=list")
+    print(f"DEBUG: gamma markets returned={len(result)}")
+    print(f"DEBUG: gamma rejected: {rejected}")
     print(f"DEBUG: gamma live markets matched={len(out)}")
+
     return out
-
-
 
 
 
