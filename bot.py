@@ -49,7 +49,7 @@ ASSET_PATTERNS = {
 }
 
 TRADE_SOURCE = "railway:fastloop"
-MIN_SHARES_PER_ORDER = 3
+MIN_SHARES_PER_ORDER = 5
 
 
 # -----------------------
