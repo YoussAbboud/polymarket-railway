@@ -2,10 +2,10 @@
   "asset": "BTC",
   "window": "5m",
   "signal_source": "binance",
-  "lookback_minutes": 5,
+  "lookback_minutes": 3,
 
   "entry_threshold": 0.05,
-  "min_momentum_pct": 0.30,
+  "min_momentum_pct": 0.15,
   "min_time_remaining": 45,
   "min_volume_ratio": 0.60,
 
