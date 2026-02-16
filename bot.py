@@ -1,34 +1,16 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (one cycle then exit).
+Railway-ready Simmer FastLoop bot (CoinGecko Version).
 
-Fixes included (your 2 issues):
-1) ✅ Crash on trade signal:
-   - import_market() returns 3 values (market_id, err, imported_flag)
-   - your run_once unpacked only 2 -> ValueError. Fixed.
-
-2) ✅ “Same trade opens in one window then closes in another” / imprecise execution:
-   - Hardened duplicate-prevention:
-        * per-window lock is written BEFORE import/trade (prevents double-fire on crashes)
-        * lock is cleared on hard failure (so you don’t miss the whole window)
-        * also checks existing positions by market_id and by window signature
-   - Hardened auto-close:
-        * only closes EXPIRED positions by default
-        * “future” positions are only closed if they are FAR in the future (likely a mistaken entry)
-          so it won’t accidentally close a live position due to parsing edge cases.
-
-3) ✅ Strict Live Execution:
-   - Removed pre-position buffers. The bot will now ONLY open positions strictly between
-     the start time and the end time of the event (no future events, no past events).
-
-Other hardening:
-- Better parsing for month name (Jan/January) and robust year/day handling
-- More defensive datetime parsing (state + simmer)
-- Trade verification path if Simmer times out
+CHANGELOG:
+- ✅ Switched Signal Source to CoinGecko (More reliable on Railway).
+- ✅ Uses 'market_chart' endpoint for 5-minute granularity (via 1-day range).
+- ✅ Keeps strict "Live Window" logic (only trades active events).
+- ✅ Keeps "Expiry Only" close logic (never panic sells future events).
 """
 
 import os, sys, json, argparse, time
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
@@ -51,7 +33,15 @@ GAMMA_MARKETS_URL = (
     "?limit=200&closed=false&tag=crypto&order=createdAt&ascending=false"
 )
 
-ASSET_SYMBOLS = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT"}
+# Map generic asset names to CoinGecko IDs
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "MATIC": "matic-network",
+    "DOGE": "dogecoin"
+}
+
 ASSET_PATTERNS = {
     "BTC": ["bitcoin up or down"],
     "ETH": ["ethereum up or down"],
@@ -59,9 +49,6 @@ ASSET_PATTERNS = {
 }
 
 TRADE_SOURCE = "railway:fastloop"
-MIN_SHARES_PER_ORDER = 3  
-
-# Lock TTL (seconds) - lowered for faster retry if failed
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # -----------------------
@@ -89,14 +76,15 @@ def append_journal(event: dict):
     with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-def api_request(url, method="GET", data=None, headers=None, timeout=45):
+def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/1.3")
+        req_headers.setdefault("User-Agent", "railway-fastloop/2.0-coingecko")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
+        
         req = Request(url, data=body, headers=req_headers, method=method)
         with urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -144,35 +132,27 @@ def lock_path_for(key: str) -> str:
 def read_lock(key: str):
     path = lock_path_for(key)
     data = load_json(path, None)
-    if not isinstance(data, dict) or "ts" not in data:
-        return None
+    if not isinstance(data, dict) or "ts" not in data: return None
     try:
         ts = datetime.fromisoformat(data["ts"])
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        if (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS:
-            return data
-    except Exception:
-        return None
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+        if (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS: return data
+    except Exception: return None
     return None
 
-def has_recent_lock(key: str) -> bool:
-    return read_lock(key) is not None
+def has_recent_lock(key: str) -> bool: return read_lock(key) is not None
 
 def write_lock(key: str, extra: dict = None):
     path = lock_path_for(key)
     payload = {"ts": now_utc().isoformat(), "key": key}
-    if isinstance(extra, dict):
-        payload.update(extra)
+    if isinstance(extra, dict): payload.update(extra)
     save_json(path, payload)
 
 def clear_lock(key: str):
     path = lock_path_for(key)
     try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+        if os.path.exists(path): os.remove(path)
+    except Exception: pass
 
 # -----------------------
 # Config
@@ -180,7 +160,7 @@ def clear_lock(key: str):
 CONFIG_DEFAULTS = {
     "asset": "BTC",
     "window": "5m",
-    "signal_source": "binance",
+    "signal_source": "coingecko", # Updated default
     "lookback_minutes": 12,
     "entry_threshold": 0.05,
     "min_momentum_pct": 0.08, 
@@ -209,13 +189,11 @@ ENV_MAP = {
 def load_config():
     cfg = dict(CONFIG_DEFAULTS)
     file_cfg = load_json("config.json", {})
-    if isinstance(file_cfg, dict):
-        cfg.update(file_cfg)
+    if isinstance(file_cfg, dict): cfg.update(file_cfg)
 
     for k, env in ENV_MAP.items():
         v = os.environ.get(env)
-        if v is None:
-            continue
+        if v is None: continue
         if isinstance(cfg.get(k), bool):
             cfg[k] = v.lower() in ("true", "1", "yes")
         elif isinstance(cfg.get(k), int):
@@ -232,31 +210,21 @@ def load_config():
 # Market discovery
 # -----------------------
 def parse_fast_market_window_utc(question: str):
-    """
-    Parses: "Bitcoin Up or Down - February 16, 10:40PM-10:45PM ET"
-    Returns (start_utc, end_utc) or None.
-    """
     import re
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        pass
+    try: from zoneinfo import ZoneInfo
+    except ImportError: pass
 
     q = (question or "").strip()
     m = re.search(r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET", q)
-    if not m:
-        return None
+    if not m: return None
 
-    month_str = m.group(1)[:3]  # normalize to 3 letters
+    month_str = m.group(1)[:3]
     day = int(m.group(2))
     t1 = m.group(3)
     t2 = m.group(4)
 
-    # Use ET for parsing
-    try:
-        ny = ZoneInfo("America/New_York")
-    except Exception:
-        ny = timezone(timedelta(hours=-5))
+    try: ny = ZoneInfo("America/New_York")
+    except Exception: ny = timezone(timedelta(hours=-5))
 
     year_now = now_utc().year
     candidates = [year_now, year_now - 1, year_now + 1]
@@ -268,8 +236,7 @@ def parse_fast_market_window_utc(question: str):
             start_local = datetime.strptime(s_str, month_fmt).replace(tzinfo=ny)
             end_local   = datetime.strptime(e_str, month_fmt).replace(tzinfo=ny)
             return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
-        except Exception:
-            return None
+        except Exception: return None
 
     best = None
     best_delta = float('inf')
@@ -286,56 +253,42 @@ def parse_fast_market_window_utc(question: str):
     return best
 
 def parse_iso_dt(s):
-    if not s:
-        return None
+    if not s: return None
     try:
         s = str(s).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
+    except Exception: return None
 
 def gamma_market_window(m: dict):
     start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
     end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
-
     if not start and m.get("startDate"):
         try:
             ts = float(m["startDate"])
             if ts > 1e12: ts /= 1000.0
             start = datetime.fromtimestamp(ts, tz=timezone.utc)
         except: pass
-
     if not end and m.get("endDate"):
         try:
             ts = float(m["endDate"])
             if ts > 1e12: ts /= 1000.0
             end = datetime.fromtimestamp(ts, tz=timezone.utc)
         except: pass
-
     return start, end
 
 # STRICTLY ENSURES WE ARE WITHIN THE BOUNDS OF THE LIVE MARKET
 def is_live_window(start: datetime, end: datetime) -> bool:
-    if not start or not end:
-        return False
+    if not start or not end: return False
     now = now_utc()
     return start <= now <= end
-
-def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
-    if not end:
-        return False
-    return (end - now_utc()).total_seconds() >= min_seconds_left
 
 def discover_fast_markets(asset: str, window: str):
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     result = api_request(GAMMA_MARKETS_URL)
-    if not isinstance(result, list):
-        return []
+    if not isinstance(result, list): return []
 
     out = []
     for m in result:
@@ -343,16 +296,11 @@ def discover_fast_markets(asset: str, window: str):
         q = q_raw.lower()
         slug = (m.get("slug") or "")
 
-        if not any(p in q for p in patterns):
-            continue
-        if m.get("closed"):
-            continue
+        if not any(p in q for p in patterns): continue
+        if m.get("closed"): continue
 
         start, end = gamma_market_window(m)
-
-        # only currently live windows (strict checking here)
-        if not is_live_window(start, end):
-            continue
+        if not is_live_window(start, end): continue
 
         out.append({
             "question": q_raw,
@@ -362,7 +310,6 @@ def discover_fast_markets(asset: str, window: str):
             "outcome_prices": m.get("outcomePrices", "[]"),
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
         })
-
     return out
 
 def select_best_market(markets, min_seconds_left: int):
@@ -370,83 +317,90 @@ def select_best_market(markets, min_seconds_left: int):
     live = []
     for m in markets:
         end = m.get("end_time")
-        if not end:
-            continue
+        if not end: continue
         left = (end - now).total_seconds()
-        if left < min_seconds_left:
-            continue
+        if left < min_seconds_left: continue
         live.append((left, m))
 
-    if not live:
-        return None
-
-    # Sort by soonest ending
+    if not live: return None
     live.sort(key=lambda x: x[0]) 
     return live[0][1]
 
 def market_window_key(question: str) -> str:
     win = parse_fast_market_window_utc(question or "")
-    if not win:
-        return (question or "").strip()
+    if not win: return (question or "").strip()
     s, e = win
     return f"{(question or '').split('-')[0].strip()}|{s.isoformat()}|{e.isoformat()}"
 
 # -----------------------
-# Signal
+# Signal: CoinGecko
 # -----------------------
-def get_binance_momentum(symbol: str, lookback_minutes: int):
-    bases = [
-        "https://api.binance.com",
-        "https://api1.binance.com",
-        "https://api2.binance.com",
-        "https://api3.binance.com",
-    ]
+def get_coingecko_momentum(asset: str, lookback_minutes: int):
+    """
+    Fetches market chart data from CoinGecko.
+    'days=1' automatically returns 5-minute interval candles, which is ideal.
+    """
+    coin_id = COINGECKO_IDS.get(asset, "bitcoin")
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+    
+    data = api_request(url, timeout=30)
+    
+    if isinstance(data, dict) and data.get("error"):
+        return {"error": f"coingecko_error: {data.get('error')}"}
+    if not isinstance(data, dict) or "prices" not in data:
+        return {"error": "coingecko_invalid_format", "raw": str(data)[:100]}
 
-    last_err = None
-    for base in bases:
-        url = f"{base}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback_minutes}"
-        candles = api_request(url, timeout=25)
+    prices = data["prices"] # List of [timestamp_ms, price]
+    if not prices or len(prices) < 2:
+        return {"error": "coingecko_insufficient_data"}
 
-        if isinstance(candles, dict) and candles.get("error"):
-            last_err = {"base": base, **candles}
-            continue
+    # CoinGecko timestamps are ms. We want the last X minutes.
+    # But for momentum, we just need the latest price vs the price 'lookback' ago.
+    # The list is sorted by time.
+    
+    # 1. Get latest price
+    latest_ts, latest_price = prices[-1]
+    
+    # 2. Find price ~lookback_minutes ago
+    target_ts = latest_ts - (lookback_minutes * 60 * 1000)
+    
+    # Find closest candle to target_ts
+    past_price = None
+    best_diff = float('inf')
+    
+    for t, p in reversed(prices):
+        diff = abs(t - target_ts)
+        if diff < best_diff:
+            best_diff = diff
+            past_price = p
+        else:
+            # If diff starts increasing, we moved too far back (since we are iterating reversed)
+            # but usually it's safer to just iterate all or scan. 
+            # Given days=1 is ~288 points, full scan is cheap.
+            pass
+            
+    if past_price is None:
+        return {"error": "coingecko_history_lookup_failed"}
+        
+    momentum_pct = ((latest_price - past_price) / past_price) * 100.0
+    direction = "up" if momentum_pct > 0 else "down"
 
-        if not isinstance(candles, list) or len(candles) < 2:
-            continue
-
-        try:
-            price_then = float(candles[0][1])
-            price_now = float(candles[-1][4])
-            momentum_pct = ((price_now - price_then) / price_then) * 100.0
-            direction = "up" if momentum_pct > 0 else "down"
-
-            vols = [float(c[5]) for c in candles]
-            avg_vol = sum(vols) / len(vols) if vols else 0.0
-            latest_vol = vols[-1] if vols else 0.0
-            vol_ratio = (latest_vol / avg_vol) if avg_vol > 0 else 1.0
-
-            return {
-                "price_now": price_now,
-                "price_then": price_then,
-                "momentum_pct": momentum_pct,
-                "direction": direction,
-                "volume_ratio": vol_ratio,
-            }
-        except Exception as e:
-            last_err = {"base": base, "error": f"parse_error: {e}"}
-            continue
-
-    return {"error": "all_binance_endpoints_failed", "details": last_err}
+    return {
+        "price_now": latest_price,
+        "price_then": past_price,
+        "momentum_pct": momentum_pct,
+        "direction": direction,
+        "volume_ratio": 1.0, # CG volume granularity is often too coarse for 5m ratio
+        "source": "coingecko"
+    }
 
 # -----------------------
 # Simmer actions
 # -----------------------
 def get_positions(api_key: str):
     r = simmer_request("/api/sdk/positions", api_key=api_key, timeout=45)
-    if isinstance(r, dict) and "positions" in r:
-        return r["positions"]
-    if isinstance(r, list):
-        return r
+    if isinstance(r, dict) and "positions" in r: return r["positions"]
+    if isinstance(r, list): return r
     return []
 
 def get_portfolio(api_key: str):
@@ -465,11 +419,8 @@ def import_market(api_key: str, slug: str):
         return None, (r.get("error") if isinstance(r, dict) else "import failed"), False
 
     status = r.get("status")
-    if status == "imported":
-        return r.get("market_id"), None, True
-    if status == "already_exists":
-        return r.get("market_id"), None, False
-
+    if status == "imported": return r.get("market_id"), None, True
+    if status == "already_exists": return r.get("market_id"), None, False
     return None, f"unexpected import status: {status}", False
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
@@ -480,32 +431,21 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         "source": TRADE_SOURCE,
         "action": action,
     }
-    if action == "sell":
-        payload["shares"] = float(shares or 0)
-    else:
-        payload["amount"] = float(amount or 0)
+    if action == "sell": payload["shares"] = float(shares or 0)
+    else: payload["amount"] = float(amount or 0)
 
-    return simmer_request(
-        "/api/sdk/trade",
-        method="POST",
-        data=payload,
-        api_key=api_key,
-        timeout=120,
-    )
+    return simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
-    if not smart_sizing:
-        return max_size
+    if not smart_sizing: return max_size
     pf = get_portfolio(api_key)
-    if not isinstance(pf, dict) or pf.get("error"):
-        return max_size
+    if not isinstance(pf, dict) or pf.get("error"): return max_size
     bal = float(pf.get("balance_usdc", 0) or 0)
-    if bal <= 0:
-        return max_size
+    if bal <= 0: return max_size
     return min(max_size, bal * smart_pct)
 
 # -----------------------
-# Risk + state
+# Main cycle
 # -----------------------
 def load_state():
     st = load_json(STATE_PATH, {})
@@ -519,23 +459,13 @@ def save_state(st: dict):
     save_json(STATE_PATH, st)
 
 def classify_position_by_question(p: dict):
-    """Returns: 'expired', 'active', or 'future' based on strictly parsed text"""
     q = (p.get("question") or "").strip()
     win = parse_fast_market_window_utc(q)
-    if not win:
-        return "active", None, None
-
+    if not win: return "active", None, None
     start_utc, end_utc = win
     now = now_utc()
-    
-    if end_utc < (now - timedelta(seconds=20)):
-        return "expired", start_utc, end_utc
-    
-    # We shouldn't auto-sell future positions anymore to be safe, 
-    # but we can return 'future' if it's distinctly ahead of time.
-    if start_utc > (now + timedelta(hours=1)):
-        return "future", start_utc, end_utc
-
+    if end_utc < (now - timedelta(seconds=20)): return "expired", start_utc, end_utc
+    if start_utc > (now + timedelta(hours=1)): return "future", start_utc, end_utc
     return "active", start_utc, end_utc
 
 def count_open_fast_positions(positions):
@@ -544,61 +474,43 @@ def count_open_fast_positions(positions):
         ql = (p.get("question") or "").lower()
         if "up or down" not in ql: continue
         if float(p.get("shares_yes", 0)) <= 0 and float(p.get("shares_no", 0)) <= 0: continue
-        
         status, _, _ = classify_position_by_question(p)
-        if status in ("active", "future"):
-            n += 1
+        if status in ("active", "future"): n += 1
     return n
 
 def already_in_this_market(positions, question: str, market_id: str = None):
     target_q = (question or "").strip()
     target_key = market_window_key(target_q)
-
     for p in positions or []:
         pq = (p.get("question") or "").strip()
         pid = str(p.get("market_id") or p.get("id") or "")
-        
         if market_id and pid and str(market_id) == pid:
-            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
-                return True
-
+            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0: return True
         if pq == target_q or market_window_key(pq) == target_key:
             status, _, _ = classify_position_by_question(p)
             if status == "expired": continue
-            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
-                return True
+            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0: return True
     return False
 
-# -----------------------
-# Main cycle
-# -----------------------
 def close_positions(api_key: str, positions, quiet: bool = False):
     closed_any = False
-    
     for p in positions or []:
         q = (p.get("question") or "")
         if "up or down" not in q.lower(): continue
-
         status, _, end_utc = classify_position_by_question(p)
-        
-        # WE NEVER AUTO CLOSE ANY ACTIVE OR FUTURE POSITIONS, ONLY EXPIRED
-        if status != "expired":
-            continue
+        if status != "expired": continue
 
         market_id = p.get("market_id") or p.get("id")
         shares_yes = float(p.get("shares_yes", 0) or 0)
         shares_no  = float(p.get("shares_no", 0) or 0)
 
-        if not quiet:
-            print(f"AUTO-CLOSE: EXPIRED | {q} | end={end_utc}")
-
+        if not quiet: print(f"AUTO-CLOSE: EXPIRED | {q} | end={end_utc}")
         if shares_yes > 0:
             execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
             closed_any = True
         if shares_no > 0:
             execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
             closed_any = True
-
     return closed_any
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
@@ -610,8 +522,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
 
     positions = get_positions(api_key)
     closed_any = close_positions(api_key, positions, quiet=quiet)
-    if closed_any:
-        positions = get_positions(api_key) 
+    if closed_any: positions = get_positions(api_key) 
 
     open_fast = count_open_fast_positions(positions)
     if open_fast >= int(cfg["max_open_fast_positions"]):
@@ -642,10 +553,10 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: already in market", force=True)
         return
 
-    symbol = ASSET_SYMBOLS.get(cfg["asset"], "BTCUSDT")
-    sig = get_binance_momentum(symbol, int(cfg["lookback_minutes"]))
+    # --- COINGECKO SIGNAL ---
+    sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
     if not sig or sig.get("error"):
-        log("SKIP: signal error", force=True)
+        log(f"SKIP: signal error -> {sig}", force=True)
         return
 
     mom_pct = sig["momentum_pct"]
@@ -667,10 +578,8 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         buy_price = 1.0 - yes_price
 
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
-
     log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
 
-    # Secure our intention
     write_lock(window_key, {"status": "pending"})
 
     market_id, err, imported = import_market(api_key, best["slug"])
@@ -688,7 +597,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     res = execute_trade(api_key, market_id, side, amount=amount)
-    
     if res and res.get("success"):
         st["trades"] = int(st.get("trades", 0)) + 1
         st["last_trade_ts"] = now_utc().isoformat()
@@ -699,8 +607,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     else:
         err2 = res.get("error") if isinstance(res, dict) else "unknown"
         log(f"TRADE: failed ({err2})", force=True)
-
-        # Verify whether trade actually landed if there was a timeout
         if "timed out" in str(err2).lower():
             time.sleep(2)
             positions2 = get_positions(api_key)
@@ -712,7 +618,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
                 st["last_trade_ts"] = now_utc().isoformat()
                 save_state(st)
                 return
-
         clear_lock(window_key)
 
 if __name__ == "__main__":

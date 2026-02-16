@@ -1,11 +1,11 @@
 {
   "asset": "BTC",
   "window": "5m",
-  "signal_source": "binance",
+  "signal_source": "coingecko",
   "lookback_minutes": 12,
 
   "entry_threshold": 0.05,
-  "min_momentum_pct": 0.08,
+  "min_momentum_pct": 0.08, 
   "min_time_remaining": 45,
   "min_volume_ratio": 0.15,
 
