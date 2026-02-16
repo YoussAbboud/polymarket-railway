@@ -539,48 +539,87 @@ def _parse_iso_utc(dt_str: str):
         return None
 
 
-def is_future_position(p: dict) -> bool:
-    resolves = _parse_iso_utc(p.get("resolves_at"))
-    if not resolves:
+def classify_position_by_question(p: dict):
+    """
+    Returns: ("future" | "live" | "expired" | "unknown"), start_utc, end_utc
+    """
+    q = (p.get("question") or "").strip()
+    win = parse_fast_market_window_utc(q)
+    if not win:
+        return "unknown", None, None
+
+    start_utc, end_utc = win
+    now = now_utc()
+
+    if start_utc > now + timedelta(minutes=2):
+        return "future", start_utc, end_utc
+
+    if end_utc < now - timedelta(seconds=30):
+        return "expired", start_utc, end_utc
+
+    return "live", start_utc, end_utc
+
+
+def is_market_expired(question: str, *, grace_after_s: int = 30) -> bool:
+    win = parse_fast_market_window_utc(question or "")
+    if not win:
         return False
+    _, end_utc = win
+    return end_utc < (now_utc() - timedelta(seconds=grace_after_s))
 
-    # If it resolves on a different UTC date than now, it's not the current fast window
-    return resolves.date() != now_utc().date()
 
+def is_position_live_now(p: dict, *, grace_before_s: int = 20, grace_after_s: int = 20) -> bool:
+    q = (p.get("question") or "").strip()
+    win = parse_fast_market_window_utc(q)
+    if not win:
+        return False
+    start_utc, end_utc = win
+    now = now_utc()
+    return (start_utc - timedelta(seconds=grace_before_s)) <= now <= (end_utc + timedelta(seconds=grace_after_s))
 
 
 def count_open_fast_positions(positions):
     n = 0
-    for p in positions:
+    for p in positions or []:
         ql = (p.get("question") or "").lower()
         if "up or down" not in ql:
             continue
 
-        # ✅ ignore wrong/future positions
-        if is_future_position(p):
+        yes = float(p.get("shares_yes", 0) or 0)
+        no  = float(p.get("shares_no", 0) or 0)
+        if yes <= 0 and no <= 0:
             continue
 
-        yes = float(p.get("shares_yes", 0) or 0)
-        no = float(p.get("shares_no", 0) or 0)
-        if yes > 0 or no > 0:
-            n += 1
+        # ✅ only count positions that are live right now
+        if not is_position_live_now(p):
+            continue
+
+        n += 1
     return n
 
 
 
 
 
+
 def already_in_this_market(positions, question: str):
-    for p in positions:
-        pq = (p.get("question") or "")
-        if pq == (question or ""):
-            if is_market_expired(pq):
-                return False  # ✅ expired position shouldn't block new trades
-            yes = float(p.get("shares_yes", 0) or 0)
-            no = float(p.get("shares_no", 0) or 0)
-            if yes > 0 or no > 0:
-                return True
+    target = (question or "").strip()
+    for p in positions or []:
+        pq = (p.get("question") or "").strip()
+        if pq != target:
+            continue
+
+        # ✅ expired market shouldn't block new trade
+        if is_market_expired(pq):
+            return False
+
+        yes = float(p.get("shares_yes", 0) or 0)
+        no  = float(p.get("shares_no", 0) or 0)
+        if yes > 0 or no > 0:
+            return True
+
     return False
+
 
 def active_fast_market_slugs(asset: str, window: str):
     markets = discover_fast_markets(asset, window)
@@ -595,70 +634,37 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
             print(msg)
 
     closed_any = False
-    for p in positions:
-        q = p.get("question") or ""
+
+    for p in positions or []:
+        q = (p.get("question") or "")
         if "up or down" not in q.lower():
             continue
 
-        if not is_future_position(p):
-            continue
+        status, start_utc, end_utc = classify_position_by_question(p)
+        if status not in ("future", "expired"):
+            continue  # do NOT close live positions
 
-        market_id = p.get("market_id")
+        market_id = p.get("market_id") or p.get("id") or p.get("marketId")
         if not market_id:
-            append_journal({"type": "warn", "reason": "no_market_id_to_close", "question": q})
             continue
 
         shares_yes = float(p.get("shares_yes", 0) or 0)
-        shares_no = float(p.get("shares_no", 0) or 0)
-        cur_val = float(p.get("current_value", 0) or 0)
+        shares_no  = float(p.get("shares_no", 0) or 0)
 
-        log(f"AUTO-CLOSE: future position detected | resolves_at={p.get('resolves_at')} | {q}")
-
-        # We try SELL using shares first (most likely),
-        # then fallback to selling by USDC value if shares-mode isn't accepted.
-        def try_sell(side: str, shares: float):
-            nonlocal closed_any
-
-            # ✅ ADD THESE PRINTS HERE
-            print(
-                f"AUTO-CLOSE: attempting close | market_id={market_id} | side={side} "
-                f"| shares={shares} | value={cur_val} | resolves_at={p.get('resolves_at')}"
-            )
-
-            r1 = execute_trade(api_key, market_id, side, shares=float(shares), action="sell")
-            print(f"AUTO-CLOSE response (sell {side}, shares):", r1)
-
-            # keep your existing journal logic / success checks here...
-
-            if shares <= 0:
-                return
-
-            # Attempt 1: amount = shares
-            r1 = execute_trade(api_key, market_id, side, shares=float(shares), action="sell")
-            append_journal({"type": "close_attempt", "mode": "shares", "side": side, "shares": shares, "market_id": market_id, "question": q, "result": r1})
-
-            if isinstance(r1, dict) and r1.get("success"):
-                log(f"AUTO-CLOSE: SELL_{side.upper()} success (shares)")
-                closed_any = True
-                return
-
-            # Attempt 2: amount = current_value (USDC)
-            # Only do this if we have a value > 0
-            if cur_val > 0:
-                r2 = execute_trade(api_key, market_id, side, amount=float(cur_val), action="sell")
-                append_journal({"type": "close_attempt", "mode": "usdc", "side": side, "amount_usdc": cur_val, "market_id": market_id, "question": q, "result": r2})
-
-                if isinstance(r2, dict) and r2.get("success"):
-                    log(f"AUTO-CLOSE: SELL_{side.upper()} success (usdc)")
-                    closed_any = True
+        log(f"AUTO-CLOSE: {status} | {q} | start={start_utc} end={end_utc}")
 
         if shares_yes > 0:
-            try_sell("yes", shares_yes)
+            res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+            append_journal({"type":"close_attempt","why":status,"side":"sell_yes","market_id":market_id,"shares":shares_yes,"result":res})
+            closed_any = True
 
         if shares_no > 0:
-            try_sell("no", shares_no)
+            res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
+            append_journal({"type":"close_attempt","why":status,"side":"sell_no","market_id":market_id,"shares":shares_no,"result":res})
+            closed_any = True
 
     return closed_any
+
 
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):

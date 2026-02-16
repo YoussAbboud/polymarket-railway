@@ -14,7 +14,7 @@
 
   "max_open_fast_positions": 2,
   "cooldown_seconds": 180,
-  "daily_trade_limit": 10,
+  "daily_trade_limit": 20,
 
   "fee_edge_buffer": 0.02
 }
