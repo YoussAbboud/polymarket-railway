@@ -247,16 +247,19 @@ def load_config():
 def parse_fast_market_window_utc(question: str):
     """
     Parses:
-      "Bitcoin Up or Down - February 16, 10:40PM-10:45PM ET"
-    Returns (start_utc, end_utc) timezone-aware UTC datetimes.
-    Uses America/New_York so DST is handled (EST/EDT).
+      "Bitcoin Up or Down - February 16, 2:55PM-3:00PM ET"
+    Returns (start_utc, end_utc) as timezone-aware UTC datetimes.
+
+    IMPORTANT: Uses America/New_York (handles DST correctly).
     """
     import re
-    from zoneinfo import ZoneInfo
+    try:
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+    except Exception:
+        ET = timezone(timedelta(hours=-5))  # fallback (may be wrong during DST)
 
-    q = (question or "").strip()
-
-    # allow "Feb" or "February"
+    q = question or ""
     m = re.search(
         r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET",
         q
@@ -264,119 +267,58 @@ def parse_fast_market_window_utc(question: str):
     if not m:
         return None
 
-    month_str = m.group(1)
-    day = int(m.group(2))
-    t1 = m.group(3)
-    t2 = m.group(4)
-
-    ny = ZoneInfo("America/New_York")
-
-    # choose year that makes most sense around "now" (handles UTC date rollover)
-    year_now = now_utc().year
-    candidates = [year_now, year_now - 1, year_now + 1]
-
-    # try parsing month as full then abbreviated
-    def try_parse(month_fmt: str, y: int):
-        try:
-            start_local = datetime.strptime(f"{month_str} {day} {y} {t1}", month_fmt).replace(tzinfo=ny)
-            end_local   = datetime.strptime(f"{month_str} {day} {y} {t2}", month_fmt).replace(tzinfo=ny)
-            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
-        except Exception:
-            return None
-
-    best = None
-    best_delta = None
-    for y in candidates:
-        win = try_parse("%B %d %Y %I:%M%p", y) or try_parse("%b %d %Y %I:%M%p", y)
-        if not win:
-            continue
-        start_utc, end_utc = win
-        # pick the year with start closest to now (within a reasonable range)
-        delta = abs((start_utc - now_utc()).total_seconds())
-        if best is None or delta < best_delta:
-            best, best_delta = win, delta
-
-    return best
-
-
-def parse_iso_dt(s):
-    if not s:
-        return None
     try:
-        s = str(s).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
+        year = now_utc().year
+        month = m.group(1)
+        day = int(m.group(2))
+        t1 = m.group(3)
+        t2 = m.group(4)
+
+        start_et = datetime.strptime(f"{month} {day} {year} {t1}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
+        end_et   = datetime.strptime(f"{month} {day} {year} {t2}", "%B %d %Y %I:%M%p").replace(tzinfo=ET)
+
+        return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
     except Exception:
         return None
 
-
-def gamma_market_window(m: dict):
-    start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
-    end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
-
-    if not start and m.get("startDate") is not None:
-        try:
-            ts = float(m["startDate"])
-            if ts > 1e12:
-                ts /= 1000.0
-            start = datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception:
-            start = None
-
-    if not end and m.get("endDate") is not None:
-        try:
-            ts = float(m["endDate"])
-            if ts > 1e12:
-                ts /= 1000.0
-            end = datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception:
-            end = None
-
-    return start, end
-
-
-def is_live_window(start: datetime, end: datetime, *, grace_s=20) -> bool:
-    if not start or not end:
-        return False
-    now = now_utc()
-    return (start - timedelta(seconds=grace_s)) <= now <= (end + timedelta(seconds=grace_s))
-
-
-def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
-    if not end:
-        return False
-    return (end - now_utc()).total_seconds() >= min_seconds_left
-
-
-def discover_fast_markets(asset: str, window: str):
+def discover_fast_markets(asset: str, window: str, *, grace_s: int = 20):
+    """
+    Pull Gamma /markets and return ONLY markets whose window is LIVE right now.
+    This is the single source of truth for timing (we do NOT trust slug math).
+    """
     patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
     result = api_request(GAMMA_MARKETS_URL)
     if not isinstance(result, list):
         return []
 
+    now = now_utc()
     out = []
     for m in result:
-        q_raw = (m.get("question") or "")
-        q = q_raw.lower()
+        q = (m.get("question") or "").lower()
         slug = (m.get("slug") or "")
 
+        if f"-{window}-" not in slug:
+            continue
         if not any(p in q for p in patterns):
             continue
         if m.get("closed"):
             continue
 
         start, end = gamma_market_window(m)
+        if not start or not end:
+            continue
 
-        # only currently live windows
-        if not is_live_window(start, end, grace_s=20):
+        # Sanity: fast windows should be short (avoid bad ms/sec parses)
+        dur = (end - start).total_seconds()
+        if dur <= 0 or dur > 60 * 30:  # >30m is definitely wrong for 5m/15m
+            continue
+
+        # HARD FILTER: must be live now (with grace)
+        if not is_live_window(start, end, grace_s=grace_s):
             continue
 
         out.append({
-            "question": q_raw,
+            "question": m.get("question", ""),
             "slug": slug,
             "start_time": start,
             "end_time": end,
@@ -384,6 +326,8 @@ def discover_fast_markets(asset: str, window: str):
             "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
         })
 
+    # Sort by soonest expiry so we always pick the current/nearest window
+    out.sort(key=lambda x: (x["end_time"] - now).total_seconds())
     return out
 
 
@@ -484,6 +428,11 @@ def get_portfolio(api_key: str):
 
 
 def import_market(api_key: str, slug: str):
+    """
+    Import (or fetch existing) market into Simmer.
+
+    Returns: (market_id, error) where only one is non-None.
+    """
     url = f"https://polymarket.com/event/{slug}"
     r = simmer_request(
         "/api/sdk/markets/import",
@@ -492,16 +441,23 @@ def import_market(api_key: str, slug: str):
         api_key=api_key,
         timeout=90
     )
-    if not isinstance(r, dict) or r.get("error"):
-        return None, (r.get("error") if isinstance(r, dict) else "import failed"), False
+
+    if not isinstance(r, dict):
+        return None, "import failed (non-json response)"
+
+    if r.get("error"):
+        return None, str(r.get("error"))
 
     status = r.get("status")
-    if status == "imported":
-        return r.get("market_id"), None, True
-    if status == "already_exists":
-        return r.get("market_id"), None, False
+    market_id = r.get("market_id")
+    if status in ("imported", "already_exists") and market_id:
+        return market_id, None
 
-    return None, f"unexpected import status: {status}", False
+    # Some responses may omit status but include market_id
+    if market_id:
+        return market_id, None
+
+    return None, f"unexpected import response: {r}"
 
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
@@ -683,11 +639,16 @@ def already_in_this_market(positions, question: str, market_id: str = None):
 # -----------------------
 # Main cycle
 # -----------------------
-def close_positions(api_key: str, positions, quiet: bool = False, future_close_min_seconds: int = 480):
+def close_positions(api_key: str, positions, quiet: bool = False,
+                    future_close_min_seconds: int = 480,
+                    expired_grace_after_s: int = 30,
+                    future_grace_before_s: int = 120):
     """
-    Safer closing:
-    - Always closes EXPIRED.
-    - Only closes FUTURE if it's FAR in the future (likely mistaken entry or stale import).
+    Close positions that should NOT be held:
+    - EXPIRED windows (end < now - grace)
+    - FUTURE windows (start > now + grace) AND far enough in the future (default >= 8m)
+
+    This prevents the "open then instantly auto-close" loop caused by bad timezone parsing.
     """
     def log(msg):
         if not quiet:
@@ -697,22 +658,28 @@ def close_positions(api_key: str, positions, quiet: bool = False, future_close_m
     now = now_utc()
 
     for p in positions or []:
-        q = (p.get("question") or "")
+        q = (p.get("question") or "").strip()
         if "up or down" not in q.lower():
             continue
 
-        status, start_utc, end_utc = classify_position_by_question(p)
-        if status == "live" or status == "unknown":
+        win = market_window_from_question(q)
+        if not win:
+            # don't close if we can't parse; better to leave than churn
             continue
 
-        if status == "future":
-            if not start_utc:
-                continue
-            # only close if it's far out (avoid accidental close due to parsing edge)
+        start_utc, end_utc = win
+
+        is_expired = now > (end_utc + timedelta(seconds=expired_grace_after_s))
+        is_future = start_utc > (now + timedelta(seconds=future_grace_before_s))
+
+        if is_future:
+            # Only close if it's far out (avoid closing near-live windows)
             if (start_utc - now).total_seconds() < future_close_min_seconds:
                 continue
 
-        # status is expired OR far-future
+        if not (is_expired or is_future):
+            continue
+
         market_id = p.get("market_id") or p.get("id") or p.get("marketId")
         if not market_id:
             continue
@@ -720,16 +687,20 @@ def close_positions(api_key: str, positions, quiet: bool = False, future_close_m
         shares_yes = float(p.get("shares_yes", 0) or 0)
         shares_no  = float(p.get("shares_no", 0) or 0)
 
-        log(f"AUTO-CLOSE: {status} | {q} | start={start_utc} end={end_utc}")
+        why = "expired" if is_expired else "future"
 
         if shares_yes > 0:
-            res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
-            append_journal({"type":"close_attempt","why":status,"side":"sell_yes","market_id":market_id,"shares":shares_yes,"result":res})
+            log(f"AUTO-CLOSE ({why}): SELL YES | shares={shares_yes:.4f} | {q}")
+            r = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+            append_journal({"type": "close_attempt", "why": why, "side": "yes", "shares": shares_yes,
+                            "market_id": market_id, "question": q, "result": r})
             closed_any = True
 
         if shares_no > 0:
-            res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
-            append_journal({"type":"close_attempt","why":status,"side":"sell_no","market_id":market_id,"shares":shares_no,"result":res})
+            log(f"AUTO-CLOSE ({why}): SELL NO | shares={shares_no:.4f} | {q}")
+            r = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
+            append_journal({"type": "close_attempt", "why": why, "side": "no", "shares": shares_no,
+                            "market_id": market_id, "question": q, "result": r})
             closed_any = True
 
     return closed_any
@@ -903,8 +874,15 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     # ✅ write a “pending” lock BEFORE import/trade so a crash can’t double-fire
     write_lock(window_key, {"status": "pending", "slug": slug, "question": best["question"]})
 
-    # ✅ FIX 1: correct unpacking (3 values)
-    market_id, err, imported_flag = import_market(api_key, slug)
+    # ✅ Import market (prefer cache to avoid hitting Simmer import quotas)
+    cached_id = get_cached_market_id(st, slug)
+    if cached_id:
+        market_id, err = cached_id, None
+    else:
+        market_id, err = import_market(api_key, slug)
+        if market_id:
+            put_cached_market_id(st, slug, market_id)
+            save_state(st)
 
     if not market_id:
         log(f"FAIL: import {err}", force=True)
