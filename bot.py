@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v4.1 - Fix Missing Helpers).
+Railway-ready Simmer FastLoop bot (v4.2 - VERIFIED).
 
-CHANGELOG:
-- ✅ FIX CRASH: Restored missing 'load_state' and 'save_state' functions.
-- ✅ ACTIVE MONITOR: Waits until 10s before expiry.
-- ✅ AUTO-CLOSE: Sells at T-10s to avoid manipulation.
+FEATURES:
+- ✅ AUTO-SLUG: Calculates correct btc-updown-5m-{timestamp} slugs.
+- ✅ ACTIVE MONITOR: Holds trade open until 10s before expiry.
+- ✅ SNIPER CLOSE: Sells at T-10s to avoid manipulation.
+- ✅ SAFETY: Checks for expiring trades on startup.
+- ✅ ROBUST: Retry logic for imports and trades.
 """
 
 import os, sys, json, argparse, time
@@ -67,7 +69,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/4.1")
+        req_headers.setdefault("User-Agent", "railway-fastloop/4.2")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -143,7 +145,7 @@ def clear_lock(key: str):
     except Exception: pass
 
 # -----------------------
-# State helpers (RESTORED)
+# State helpers
 # -----------------------
 def load_state():
     st = load_json(STATE_PATH, {})
@@ -157,6 +159,30 @@ def save_state(st: dict):
     save_json(STATE_PATH, st)
 
 # -----------------------
+# Position Check Helper
+# -----------------------
+def already_in_this_market(positions, slug: str, market_id: str = None):
+    target_slug = (slug or "").strip().lower()
+
+    for p in positions or []:
+        # Check by ID
+        if market_id:
+            pid = str(p.get("market_id") or p.get("id") or "")
+            if pid == str(market_id):
+                if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
+                    return True
+        
+        # Check by Slug/URL
+        p_slug = str(p.get("slug") or "").lower()
+        p_url = str(p.get("polymarket_url") or "").lower()
+        
+        if target_slug and (target_slug in p_slug or target_slug in p_url):
+            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
+                return True
+                
+    return False
+
+# -----------------------
 # Config
 # -----------------------
 CONFIG_DEFAULTS = {
@@ -168,9 +194,9 @@ CONFIG_DEFAULTS = {
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
     "min_volume_ratio": 0.15,
-    "max_position": 3.0, 
+    "max_position": 5.0, 
     "smart_sizing_pct": 0.05,
-    "max_open_fast_positions": 1,
+    "max_open_fast_positions": 2,
     "cooldown_seconds": 80,
     "daily_trade_limit": 20,
     "daily_import_limit": 20,
@@ -209,7 +235,7 @@ def load_config():
     return cfg
 
 # -----------------------
-# Market Discovery (Timestamp-based)
+# Market Discovery
 # -----------------------
 def get_current_window_slug(asset: str):
     now = now_utc()
