@@ -42,7 +42,7 @@ LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 # --- STRATEGY SETTINGS ---
 CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
 STOP_LOSS_PCT = 0.15        # -15%
-TAKE_PROFIT_PCT = 0.30      # +30%
+TAKE_PROFIT_PCT = 0.20      # +30%
 
 # -----------------------
 # Helpers
