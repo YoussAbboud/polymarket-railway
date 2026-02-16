@@ -545,11 +545,33 @@ def load_state():
     st = load_json(STATE_PATH, {})
     if not isinstance(st, dict):
         st = {}
-    today = date.today().isoformat()
+
+    today = now_utc().date().isoformat()   # ✅ UTC day (not local)
     if st.get("day") != today:
-        st = {"day": today, "trades": 0, "imports": 0, "last_trade_ts": None}
+        st = {
+            "day": today,
+            "trades": 0,
+            "imports": 0,
+            "last_trade_ts": None,
+            "imported_markets": {},  # ✅ slug -> {market_id, ts}
+        }
+
     st.setdefault("imports", 0)
+    st.setdefault("trades", 0)
+    st.setdefault("imported_markets", {})
     return st
+
+def get_cached_market_id(st: dict, slug: str):
+    rec = (st.get("imported_markets") or {}).get(slug)
+    if isinstance(rec, dict) and rec.get("market_id"):
+        return str(rec["market_id"])
+    if isinstance(rec, str):
+        return rec
+    return None
+
+def cache_market(st: dict, slug: str, market_id: str):
+    st.setdefault("imported_markets", {})
+    st["imported_markets"][slug] = {"market_id": str(market_id), "ts": now_utc().isoformat()}
 
 
 def save_state(st: dict):
