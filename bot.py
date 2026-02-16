@@ -39,7 +39,7 @@ TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
-CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
+CLOSE_BUFFER_SECONDS = 60   # Close 30s before end
 STOP_LOSS_PCT = 0.05        # -5% Loss
 TAKE_PROFIT_PCT = 0.15      # +15% Profit
 
