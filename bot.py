@@ -2,20 +2,25 @@
 """
 Railway-ready Simmer FastLoop bot (one cycle then exit).
 
-Core idea is the same as polymarket-clawd:
-- Discover Polymarket fast markets via Gamma
-- Pull Binance 1m klines to compute momentum
-- If signal passes thresholds, import market via Simmer and trade via Simmer
+Fixes included (your 2 issues):
+1) ✅ Crash on trade signal:
+   - import_market() returns 3 values (market_id, err, imported_flag)
+   - your run_once unpacked only 2 -> ValueError. Fixed.
 
-Improvements:
-- Prevent duplicate entries (skip if you already have a position for the same question)
-- Risk caps: max open positions, cooldown, daily trade limit
-- Persistent state + trade journal on /data (Railway Volume)
+2) ✅ “Same trade opens in one window then closes in another” / imprecise execution:
+   - Hardened duplicate-prevention:
+        * per-window lock is written BEFORE import/trade (prevents double-fire on crashes)
+        * lock is cleared on hard failure (so you don’t miss the whole window)
+        * also checks existing positions by market_id and by window signature
+   - Hardened auto-close:
+        * only closes EXPIRED positions by default
+        * “future” positions are only closed if they are FAR in the future (likely a mistaken entry)
+          so it won’t accidentally close a live position due to parsing edge cases.
 
-Additional hardening:
-- Local lock w/ TTL in /data to prevent duplicate orders on API timeouts
-- Longer Simmer timeouts for import/trade
-- Verify position after timeout (trade may have succeeded server-side)
+Other hardening:
+- Better parsing for month name (Jan/January) and robust year/day handling
+- More defensive datetime parsing (state + simmer)
+- Trade verification path if Simmer times out
 """
 
 import os, sys, json, argparse, time
@@ -50,9 +55,9 @@ ASSET_PATTERNS = {
 }
 
 TRADE_SOURCE = "railway:fastloop"
-MIN_SHARES_PER_ORDER = 5  # consider 3 if you want smaller trades
+MIN_SHARES_PER_ORDER = 5  # lower to 3 if you want smaller orders
 
-# Lock TTL (seconds) to prevent duplicate orders on timeouts / lag
+# Lock TTL (seconds) to prevent duplicate orders on timeouts / crashes
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "900"))  # 15 minutes
 
 
@@ -88,14 +93,18 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=45):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/1.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/1.1")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
             req_headers["Content-Type"] = "application/json"
         req = Request(url, data=body, headers=req_headers, method=method)
         with urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"error": "non_json_response", "raw": raw[:500]}
     except HTTPError as e:
         try:
             err = json.loads(e.read().decode("utf-8"))
@@ -103,7 +112,7 @@ def api_request(url, method="GET", data=None, headers=None, timeout=45):
         except Exception:
             return {"error": str(e), "status_code": e.code}
     except URLError as e:
-        return {"error": f"Connection error: {e.reason}"}
+        return {"error": f"Connection error: {getattr(e, 'reason', e)}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -130,28 +139,48 @@ def get_api_key():
 
 
 # -----------------------
-# Lock helpers
+# Lock helpers (per window)
 # -----------------------
-def lock_path_for(slug: str) -> str:
-    safe = (slug or "").replace("/", "_")
+def lock_path_for(key: str) -> str:
+    safe = (key or "").replace("/", "_").replace(" ", "_")
     return os.path.join(DATA_DIR, f"lock_{safe}.json")
 
 
-def has_recent_lock(slug: str) -> bool:
-    path = lock_path_for(slug)
+def read_lock(key: str):
+    path = lock_path_for(key)
     data = load_json(path, None)
     if not isinstance(data, dict) or "ts" not in data:
-        return False
+        return None
     try:
         ts = datetime.fromisoformat(data["ts"])
-        return (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS:
+            return data
     except Exception:
-        return False
+        return None
+    return None
 
 
-def write_lock(slug: str):
-    path = lock_path_for(slug)
-    save_json(path, {"ts": now_utc().isoformat(), "slug": slug})
+def has_recent_lock(key: str) -> bool:
+    return read_lock(key) is not None
+
+
+def write_lock(key: str, extra: dict = None):
+    path = lock_path_for(key)
+    payload = {"ts": now_utc().isoformat(), "key": key}
+    if isinstance(extra, dict):
+        payload.update(extra)
+    save_json(path, payload)
+
+
+def clear_lock(key: str):
+    path = lock_path_for(key)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 # -----------------------
@@ -171,7 +200,10 @@ CONFIG_DEFAULTS = {
     "max_open_fast_positions": 1,
     "cooldown_seconds": 120,
     "daily_trade_limit": 20,
+    "daily_import_limit": 10,
     "fee_edge_buffer": 0.02,
+    # only auto-close “future” positions if they are far out (likely a bug)
+    "future_close_min_seconds": 8 * 60,  # 8 minutes
 }
 
 ENV_MAP = {
@@ -215,7 +247,7 @@ def load_config():
 def parse_fast_market_window_utc(question: str):
     """
     Parses:
-      "Bitcoin Up or Down - February 16, 3:45PM-3:50PM ET"
+      "Bitcoin Up or Down - February 16, 10:40PM-10:45PM ET"
     Returns (start_utc, end_utc) timezone-aware UTC datetimes.
     Uses America/New_York so DST is handled (EST/EDT).
     """
@@ -223,6 +255,8 @@ def parse_fast_market_window_utc(question: str):
     from zoneinfo import ZoneInfo
 
     q = (question or "").strip()
+
+    # allow "Feb" or "February"
     m = re.search(
         r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{1,2}:\d{2}(?:AM|PM))-(\d{1,2}:\d{2}(?:AM|PM))\s*ET",
         q
@@ -230,22 +264,92 @@ def parse_fast_market_window_utc(question: str):
     if not m:
         return None
 
+    month_str = m.group(1)
+    day = int(m.group(2))
+    t1 = m.group(3)
+    t2 = m.group(4)
+
+    ny = ZoneInfo("America/New_York")
+
+    # choose year that makes most sense around "now" (handles UTC date rollover)
+    year_now = now_utc().year
+    candidates = [year_now, year_now - 1, year_now + 1]
+
+    # try parsing month as full then abbreviated
+    def try_parse(month_fmt: str, y: int):
+        try:
+            start_local = datetime.strptime(f"{month_str} {day} {y} {t1}", month_fmt).replace(tzinfo=ny)
+            end_local   = datetime.strptime(f"{month_str} {day} {y} {t2}", month_fmt).replace(tzinfo=ny)
+            return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    best = None
+    best_delta = None
+    for y in candidates:
+        win = try_parse("%B %d %Y %I:%M%p", y) or try_parse("%b %d %Y %I:%M%p", y)
+        if not win:
+            continue
+        start_utc, end_utc = win
+        # pick the year with start closest to now (within a reasonable range)
+        delta = abs((start_utc - now_utc()).total_seconds())
+        if best is None or delta < best_delta:
+            best, best_delta = win, delta
+
+    return best
+
+
+def parse_iso_dt(s):
+    if not s:
+        return None
     try:
-        year = now_utc().year
-        month = m.group(1)
-        day = int(m.group(2))
-        t1 = m.group(3)
-        t2 = m.group(4)
-
-        ny = ZoneInfo("America/New_York")
-
-        start_local = datetime.strptime(f"{month} {day} {year} {t1}", "%B %d %Y %I:%M%p").replace(tzinfo=ny)
-        end_local   = datetime.strptime(f"{month} {day} {year} {t2}", "%B %d %Y %I:%M%p").replace(tzinfo=ny)
-
-        return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+        s = str(s).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
+
+def gamma_market_window(m: dict):
+    start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
+    end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
+
+    if not start and m.get("startDate") is not None:
+        try:
+            ts = float(m["startDate"])
+            if ts > 1e12:
+                ts /= 1000.0
+            start = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            start = None
+
+    if not end and m.get("endDate") is not None:
+        try:
+            ts = float(m["endDate"])
+            if ts > 1e12:
+                ts /= 1000.0
+            end = datetime.fromtimestamp(ts, tz=timezone.utc)
+        except Exception:
+            end = None
+
+    return start, end
+
+
+def is_live_window(start: datetime, end: datetime, *, grace_s=20) -> bool:
+    if not start or not end:
+        return False
+    now = now_utc()
+    return (start - timedelta(seconds=grace_s)) <= now <= (end + timedelta(seconds=grace_s))
+
+
+def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
+    if not end:
+        return False
+    return (end - now_utc()).total_seconds() >= min_seconds_left
 
 
 def discover_fast_markets(asset: str, window: str):
@@ -267,7 +371,7 @@ def discover_fast_markets(asset: str, window: str):
 
         start, end = gamma_market_window(m)
 
-        # ✅ ONLY CURRENTLY LIVE windows
+        # only currently live windows
         if not is_live_window(start, end, grace_s=20):
             continue
 
@@ -281,9 +385,6 @@ def discover_fast_markets(asset: str, window: str):
         })
 
     return out
-
-
-
 
 
 def select_best_market(markets, min_seconds_left: int):
@@ -305,89 +406,14 @@ def select_best_market(markets, min_seconds_left: int):
     return live[0][1]
 
 
+def market_window_key(question: str) -> str:
+    """Stable key for the specific 5-min window (used for locking / dedupe)."""
+    win = parse_fast_market_window_utc(question or "")
+    if not win:
+        return (question or "").strip()
+    s, e = win
+    return f"{(question or '').split('-')[0].strip()}|{s.isoformat()}|{e.isoformat()}"
 
-
-
-def parse_iso_dt(s):
-    if not s:
-        return None
-    try:
-        s = str(s).strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-
-def parse_ts_any(v):
-    """
-    Accepts numeric seconds, numeric ms, or numeric strings.
-    Returns UTC datetime or None.
-    """
-    if v is None:
-        return None
-    try:
-        # If it's already a datetime
-        if isinstance(v, datetime):
-            return v.astimezone(timezone.utc)
-
-        # ISO string?
-        iso = parse_iso_dt(v)
-        if iso:
-            return iso
-
-        # numeric string/number
-        ts = float(v)
-        if ts > 1e12:  # ms
-            ts /= 1000.0
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    except Exception:
-        return None
-
-
-def gamma_market_window(m: dict):
-    # Prefer ISO fields if present
-    start = parse_iso_dt(m.get("startDateIso")) or parse_iso_dt(m.get("start_date_iso"))
-    end   = parse_iso_dt(m.get("endDateIso"))   or parse_iso_dt(m.get("end_date_iso"))
-
-    # Fallback: numeric fields (sometimes ms) — HARDENED
-    if not start and m.get("startDate") is not None:
-        try:
-            ts = float(m["startDate"])
-            if ts > 1e12:  # ms
-                ts /= 1000.0
-            start = datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception:
-            start = None
-
-    if not end and m.get("endDate") is not None:
-        try:
-            ts = float(m["endDate"])
-            if ts > 1e12:  # ms
-                ts /= 1000.0
-            end = datetime.fromtimestamp(ts, tz=timezone.utc)
-        except Exception:
-            end = None
-
-    return start, end
-
-
-def is_live_window(start: datetime, end: datetime, *, grace_s=20) -> bool:
-    if not start or not end:
-        return False
-    now = now_utc()
-    # allow a small grace before/after
-    return (start - timedelta(seconds=grace_s)) <= now <= (end + timedelta(seconds=grace_s))
-
-def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
-    if not end:
-        return False
-    return (end - now_utc()).total_seconds() >= min_seconds_left
 
 # -----------------------
 # Signal
@@ -415,6 +441,7 @@ def get_binance_momentum(symbol: str, lookback_minutes: int):
             continue
 
         try:
+            # open of first candle vs close of last candle
             price_then = float(candles[0][1])
             price_now = float(candles[-1][4])
             momentum_pct = ((price_now - price_then) / price_then) * 100.0
@@ -463,7 +490,7 @@ def import_market(api_key: str, slug: str):
         method="POST",
         data={"polymarket_url": url, "shared": True},
         api_key=api_key,
-        timeout=60
+        timeout=90
     )
     if not isinstance(r, dict) or r.get("error"):
         return None, (r.get("error") if isinstance(r, dict) else "import failed"), False
@@ -477,14 +504,13 @@ def import_market(api_key: str, slug: str):
     return None, f"unexpected import status: {status}", False
 
 
-
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     payload = {
         "market_id": market_id,
-        "side": side,
+        "side": side,               # "yes" or "no"
         "venue": "polymarket",
         "source": TRADE_SOURCE,
-        "action": action,  # "buy" or "sell"
+        "action": action,           # "buy" or "sell"
     }
     if action == "sell":
         payload["shares"] = float(shares or 0)
@@ -496,11 +522,8 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         method="POST",
         data=payload,
         api_key=api_key,
-        timeout=60,
+        timeout=90,
     )
-
-
-
 
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
@@ -513,6 +536,7 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
     if bal <= 0:
         return max_size
     return min(max_size, bal * smart_pct)
+
 
 # -----------------------
 # Risk + state
@@ -528,17 +552,15 @@ def load_state():
     return st
 
 
-
 def save_state(st: dict):
     save_json(STATE_PATH, st)
 
 
-def _parse_iso_utc(dt_str: str):
+def parse_state_dt(dt_str: str):
     if not dt_str:
         return None
     try:
         dt = datetime.fromisoformat(dt_str)
-        # Simmer gives naive ISO (no tz). Treat as UTC.
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -597,7 +619,6 @@ def count_open_fast_positions(positions):
         if yes <= 0 and no <= 0:
             continue
 
-        # ✅ only count positions that are live right now
         if not is_position_live_now(p):
             continue
 
@@ -605,42 +626,53 @@ def count_open_fast_positions(positions):
     return n
 
 
+def already_in_this_market(positions, question: str, market_id: str = None):
+    """
+    Strong dedupe:
+    - if market_id is known, match by market_id first
+    - else match by question exact OR by window key
+    """
+    target_q = (question or "").strip()
+    target_key = market_window_key(target_q)
 
-
-
-
-def already_in_this_market(positions, question: str):
-    target = (question or "").strip()
     for p in positions or []:
         pq = (p.get("question") or "").strip()
-        if pq != target:
-            continue
 
-        # ✅ expired market shouldn't block new trade
-        if is_market_expired(pq):
-            return False
+        # market_id match (best)
+        pid = str(p.get("market_id") or p.get("id") or p.get("marketId") or "")
+        if market_id and pid and str(market_id) == pid:
+            yes = float(p.get("shares_yes", 0) or 0)
+            no  = float(p.get("shares_no", 0) or 0)
+            if yes > 0 or no > 0:
+                return True
 
-        yes = float(p.get("shares_yes", 0) or 0)
-        no  = float(p.get("shares_no", 0) or 0)
-        if yes > 0 or no > 0:
-            return True
+        # question match
+        if pq == target_q or market_window_key(pq) == target_key:
+            if is_market_expired(pq):
+                continue
+            yes = float(p.get("shares_yes", 0) or 0)
+            no  = float(p.get("shares_no", 0) or 0)
+            if yes > 0 or no > 0:
+                return True
 
     return False
 
 
-def active_fast_market_slugs(asset: str, window: str):
-    markets = discover_fast_markets(asset, window)
-    return set(m["slug"] for m in markets if m.get("slug"))
-
 # -----------------------
 # Main cycle
 # -----------------------
-def close_future_positions(api_key: str, positions, quiet: bool = False):
+def close_positions(api_key: str, positions, quiet: bool = False, future_close_min_seconds: int = 480):
+    """
+    Safer closing:
+    - Always closes EXPIRED.
+    - Only closes FUTURE if it's FAR in the future (likely mistaken entry or stale import).
+    """
     def log(msg):
         if not quiet:
             print(msg)
 
     closed_any = False
+    now = now_utc()
 
     for p in positions or []:
         q = (p.get("question") or "")
@@ -648,9 +680,17 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
             continue
 
         status, start_utc, end_utc = classify_position_by_question(p)
-        if status not in ("future", "expired"):
-            continue  # do NOT close live positions
+        if status == "live" or status == "unknown":
+            continue
 
+        if status == "future":
+            if not start_utc:
+                continue
+            # only close if it's far out (avoid accidental close due to parsing edge)
+            if (start_utc - now).total_seconds() < future_close_min_seconds:
+                continue
+
+        # status is expired OR far-future
         market_id = p.get("market_id") or p.get("id") or p.get("marketId")
         if not market_id:
             continue
@@ -673,7 +713,6 @@ def close_future_positions(api_key: str, positions, quiet: bool = False):
     return closed_any
 
 
-
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
         if not quiet or force:
@@ -691,25 +730,15 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     positions = get_positions(api_key)
-    # DEBUG: print one position so we can see the exact Simmer fields
-    if positions:
-        print("DEBUG position keys:", list(positions[0].keys()))
-        print("DEBUG first position sample:", json.dumps(positions[0], indent=2)[:4000])
-    else:
-        print("DEBUG: no positions returned")
-
     print(f"DEBUG: positions fetched = {len(positions)}")
-    print("DEBUG: running close_future_positions() now...")
-    closed_any = close_future_positions(api_key, positions, quiet=quiet)
-    print(f"DEBUG: close_future_positions returned {closed_any}")
 
-    print("DEBUG: after close_future_positions, continuing…")
-    print(f"DEBUG: state trades={st.get('trades')} day={st.get('day')} last_trade_ts={st.get('last_trade_ts')}")
-    print(f"DEBUG: cfg daily_trade_limit={cfg['daily_trade_limit']} cooldown={cfg['cooldown_seconds']} cap={cfg['max_open_fast_positions']}")
-
+    closed_any = close_positions(
+        api_key,
+        positions,
+        quiet=quiet,
+        future_close_min_seconds=int(cfg.get("future_close_min_seconds", 480))
+    )
     if closed_any:
-        print("INFO: attempted to close future positions")
-        # refresh positions after closing
         positions = get_positions(api_key)
         print(f"DEBUG: positions after close attempt = {len(positions)}")
 
@@ -720,21 +749,20 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     if st.get("last_trade_ts"):
-        last = datetime.fromisoformat(st["last_trade_ts"])
-        since = (now_utc() - last).total_seconds()
-        if since < int(cfg["cooldown_seconds"]):
-            log(f"SKIP: cooldown ({since:.0f}s < {cfg['cooldown_seconds']}s)", force=True)
-            append_journal({"type": "skip", "reason": "cooldown", "since_s": since})
-            return
+        last = parse_state_dt(st["last_trade_ts"])
+        if last:
+            since = (now_utc() - last).total_seconds()
+            if since < int(cfg["cooldown_seconds"]):
+                log(f"SKIP: cooldown ({since:.0f}s < {cfg['cooldown_seconds']}s)", force=True)
+                append_journal({"type": "skip", "reason": "cooldown", "since_s": since})
+                return
 
     if int(st.get("trades", 0)) >= int(cfg["daily_trade_limit"]):
         log(f"SKIP: daily trade limit reached ({st.get('trades')} >= {cfg['daily_trade_limit']})", force=True)
         append_journal({"type": "skip", "reason": "daily_trade_limit", "trades": st.get("trades")})
         return
 
-
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
-    print("DEBUG: starting market discovery…")
     if not markets:
         log("SKIP: no active fast markets")
         append_journal({"type": "skip", "reason": "no_markets"})
@@ -749,30 +777,34 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     start = best.get("start_time")
     end   = best.get("end_time")
 
-    # Safety: should already be live because discover_fast_markets hard-filters it,
-    # but keep a guard anyway.
     if not is_live_window(start, end, grace_s=20):
-        log(f"SKIP: selected market is not live (gamma start={start}, end={end})", force=True)
-        append_journal({"type": "skip", "reason": "best_not_live", "slug": best.get("slug"), "question": best.get("question")})
+        log("SKIP: selected market is not live (guard)", force=True)
+        append_journal({"type": "skip", "reason": "best_not_live", "slug": best.get("slug")})
         return
 
     if not has_time_remaining(end, int(cfg["min_time_remaining"])):
-        log("SKIP: no market with enough time remaining", force=True)
-        append_journal({"type": "skip", "reason": "too_close_to_expiry", "slug": best.get("slug"), "question": best.get("question")})
+        log("SKIP: too close to expiry", force=True)
+        append_journal({"type": "skip", "reason": "too_close_to_expiry", "slug": best.get("slug")})
         return
 
+    # Per-window key (stronger than slug)
+    window_key = market_window_key(best["question"])
+    slug = best.get("slug") or ""
 
-    # ✅ lock check (prevents duplicate orders across cron runs)
-    if has_recent_lock(best["slug"]):
-        log("SKIP: recent lock exists for this market (prevents duplicate orders)", force=True)
-        append_journal({"type": "skip", "reason": "recent_lock", "slug": best["slug"]})
+    # ✅ lock check (prevents duplicate orders across cron runs / crashes)
+    if has_recent_lock(window_key):
+        lk = read_lock(window_key) or {}
+        log(f"SKIP: recent lock exists for this window (status={lk.get('status')})", force=True)
+        append_journal({"type": "skip", "reason": "recent_lock", "window_key": window_key, "slug": slug})
         return
 
+    # Quick check for existing position in the same window
     if already_in_this_market(positions, best["question"]):
         log("SKIP: already have a position in this exact market window", force=True)
         append_journal({"type": "skip", "reason": "already_in_market", "question": best["question"]})
         return
 
+    # Parse prices
     try:
         prices = json.loads(best.get("outcome_prices", "[]"))
         yes_price = float(prices[0]) if prices else 0.5
@@ -781,6 +813,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
 
     fee_rate = (int(best.get("fee_rate_bps", 0)) / 10000.0) if best.get("fee_rate_bps") else 0.0
 
+    # Signal
     symbol = ASSET_SYMBOLS.get(cfg["asset"], "BTCUSDT")
     sig = get_binance_momentum(symbol, int(cfg["lookback_minutes"]))
     if not sig or (isinstance(sig, dict) and sig.get("error")):
@@ -845,10 +878,28 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({"type":"skip","reason":"daily_import_limit","imports":st.get("imports")})
         return
 
-    market_id, err = import_market(api_key, best["slug"])
+    # ✅ write a “pending” lock BEFORE import/trade so a crash can’t double-fire
+    write_lock(window_key, {"status": "pending", "slug": slug, "question": best["question"]})
+
+    # ✅ FIX 1: correct unpacking (3 values)
+    market_id, err, imported_flag = import_market(api_key, slug)
+
     if not market_id:
         log(f"FAIL: import {err}", force=True)
-        append_journal({"type": "error", "stage": "import", "error": err, "slug": best["slug"]})
+        append_journal({"type": "error", "stage": "import", "error": err, "slug": slug, "window_key": window_key})
+        clear_lock(window_key)  # allow retry this window if import truly failed
+        return
+
+    # update lock with market id
+    write_lock(window_key, {"status": "imported", "slug": slug, "market_id": str(market_id), "question": best["question"]})
+
+    # refresh positions and re-check: if we already hold this window, do NOT buy again
+    positions_refresh = get_positions(api_key)
+    if already_in_this_market(positions_refresh, best["question"], market_id=market_id):
+        log("SKIP: position already exists after import (dedupe)", force=True)
+        append_journal({"type":"skip","reason":"already_in_market_post_import","market_id":market_id,"window_key":window_key})
+        # keep lock to prevent re-fires
+        write_lock(window_key, {"status": "held", "slug": slug, "market_id": str(market_id), "question": best["question"]})
         return
 
     if not live:
@@ -857,7 +908,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         append_journal({
             "type": "dry_run",
             "question": best["question"],
-            "slug": best["slug"],
+            "slug": slug,
             "market_id": market_id,
             "side": side,
             "amount": amount,
@@ -867,22 +918,27 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             "volume_ratio": sig["volume_ratio"],
             "divergence": divergence,
             "fee_rate": fee_rate,
+            "imported": imported_flag,
         })
+        # keep lock so it doesn't “dry-run spam”
+        write_lock(window_key, {"status": "dry_run", "slug": slug, "market_id": str(market_id)})
         return
 
-    # ✅ write lock only when we're about to submit an order
-    write_lock(best["slug"])
+    # Execute trade
+    write_lock(window_key, {"status": "trading", "slug": slug, "market_id": str(market_id)})
 
-    result = execute_trade(api_key, market_id, side, amount)
+    result = execute_trade(api_key, market_id, side, amount=amount, action="buy")
     if isinstance(result, dict) and result.get("success"):
         st["trades"] = int(st.get("trades", 0)) + 1
         st["last_trade_ts"] = now_utc().isoformat()
+        st["imports"] = int(st.get("imports", 0)) + (1 if imported_flag else 0)
         save_state(st)
 
         append_journal({
             "type": "trade",
             "question": best["question"],
-            "slug": best["slug"],
+            "slug": slug,
+            "window_key": window_key,
             "market_id": market_id,
             "side": side,
             "amount": amount,
@@ -895,18 +951,28 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             "trade_id": result.get("trade_id"),
         })
         log("TRADE: success", force=True)
+        write_lock(window_key, {"status": "done", "slug": slug, "market_id": str(market_id), "trade_id": result.get("trade_id")})
     else:
-        err = (result.get("error") if isinstance(result, dict) else "no response")
-        append_journal({"type": "error", "stage": "trade", "error": err, "market_id": market_id})
-        log(f"TRADE: failed ({err})", force=True)
+        err2 = (result.get("error") if isinstance(result, dict) else "no response")
+        append_journal({"type": "error", "stage": "trade", "error": err2, "market_id": market_id, "window_key": window_key})
+        log(f"TRADE: failed ({err2})", force=True)
 
-        # ✅ If timeout, verify whether trade actually landed
-        if "timed out" in str(err).lower():
+        # If timeout, verify whether trade actually landed
+        if "timed out" in str(err2).lower():
             time.sleep(2)
             positions2 = get_positions(api_key)
-            if already_in_this_market(positions2, best["question"]):
+            if already_in_this_market(positions2, best["question"], market_id=market_id):
                 log("TRADE: success (verified after timeout)", force=True)
-                append_journal({"type": "trade_verified", "market_id": market_id, "question": best["question"]})
+                append_journal({"type": "trade_verified", "market_id": market_id, "question": best["question"], "window_key": window_key})
+                write_lock(window_key, {"status": "done_verified", "slug": slug, "market_id": str(market_id)})
+                # count it as a trade
+                st["trades"] = int(st.get("trades", 0)) + 1
+                st["last_trade_ts"] = now_utc().isoformat()
+                save_state(st)
+                return
+
+        # Hard fail (not timeout): clear lock so you can retry this window if you want
+        clear_lock(window_key)
 
 
 if __name__ == "__main__":
