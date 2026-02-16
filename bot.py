@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v3.0 - Timestamp Slug Fix).
+Railway-ready Simmer FastLoop bot (v4.0 - Active Monitor & Auto-Close).
 
 CHANGELOG:
-- ✅ FIX SLUG GENERATION: Now constructs the EXACT slug using Unix timestamps.
-  (e.g. btc-updown-5m-1771263000) instead of guessing text names.
-- ✅ PRECISE TIMING: Rounds current time to the nearest 5-minute bucket.
-- ✅ DIRECT IMPORT: Imports the exact URL, bypassing search entirely.
+- ✅ ACTIVE MONITOR: After buying, the bot WAITS until 10s before expiry.
+- ✅ AUTO-CLOSE: At T-10s, it automatically sells the position to avoid manipulation.
+- ✅ SAFETY NET: On startup, checks for any positions <10s from expiry and closes them.
 """
 
 import os, sys, json, argparse, time
@@ -38,6 +37,7 @@ COINGECKO_IDS = {
 
 TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
+CLOSE_BUFFER_SECONDS = 10  # Seconds before end to close
 
 # -----------------------
 # Helpers
@@ -67,7 +67,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/3.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/4.0")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -154,9 +154,9 @@ CONFIG_DEFAULTS = {
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
     "min_volume_ratio": 0.15,
-    "max_position": 5.0, 
+    "max_position": 3.0, 
     "smart_sizing_pct": 0.05,
-    "max_open_fast_positions": 2,
+    "max_open_fast_positions": 1,
     "cooldown_seconds": 80,
     "daily_trade_limit": 20,
     "daily_import_limit": 20,
@@ -195,31 +195,18 @@ def load_config():
     return cfg
 
 # -----------------------
-# MARKET DISCOVERY (FIXED)
+# Market Discovery (Timestamp-based)
 # -----------------------
 def get_current_window_slug(asset: str):
-    """
-    Calculates the EXACT slug for the CURRENT 5-minute window.
-    Formula: btc-updown-5m-{timestamp}
-    Timestamp is the current 5-minute block start time.
-    """
     now = now_utc()
-    # Round down to nearest 5 minutes
-    # e.g. 17:33 -> 17:30
     minute = (now.minute // 5) * 5
     start_dt = now.replace(minute=minute, second=0, microsecond=0)
-    
-    # Polymarket uses Unix Timestamp (seconds) for the ID
     ts = int(start_dt.timestamp())
     
-    # Construct slug
-    # Asset prefix mapping (BTC -> btc, ETH -> eth)
     asset_prefix = asset.lower()
     if asset_prefix == "bitcoin": asset_prefix = "btc"
     
     slug = f"{asset_prefix}-updown-5m-{ts}"
-    
-    # Also calculate end time for metadata
     end_dt = start_dt + timedelta(minutes=5)
     
     return {
@@ -231,45 +218,30 @@ def get_current_window_slug(asset: str):
     }
 
 def discover_fast_markets(asset: str, window: str):
-    """
-    Directly constructs the target market for right now.
-    """
     target = get_current_window_slug(asset)
-    
-    # Sanity check: Are we too close to the end?
-    # If < 45 seconds left, maybe look at the NEXT window? 
-    # For now, let's stick to strict current window logic.
-    
     return [target]
 
 def select_best_market(markets, min_seconds_left: int):
     now = now_utc()
-    # Since we only generate ONE target (the correct one), check if it's still valid.
     if not markets: return None
-    
     m = markets[0]
     end = m.get("end_time")
-    
     left = (end - now).total_seconds()
     if left < min_seconds_left:
-        # If current window is ending too soon, we could optionally return the NEXT one.
-        # But per your logic, we just skip trading this cycle.
         return None
-        
     return m
 
 def market_window_key(slug: str) -> str:
     return slug
 
 # -----------------------
-# Signal: CoinGecko
+# Signal
 # -----------------------
 def get_coingecko_momentum(asset: str, lookback_minutes: int):
     coin_id = COINGECKO_IDS.get(asset, "bitcoin")
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     
     data = api_request(url, timeout=30)
-    
     if isinstance(data, dict) and data.get("error"):
         return {"error": f"coingecko_error: {data.get('error')}"}
     if not isinstance(data, dict) or "prices" not in data:
@@ -321,7 +293,6 @@ def get_portfolio(api_key: str):
     return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
 
 def find_simmer_market_broad(api_key: str, slug: str):
-    # Try direct ID/Slug match from API since we now know exact slug
     r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
     if isinstance(r, dict) and "markets" in r:
         for m in r["markets"]:
@@ -330,37 +301,20 @@ def find_simmer_market_broad(api_key: str, slug: str):
     return None
 
 def import_market(api_key: str, slug: str):
-    # 1. Check existence
     existing_id = find_simmer_market_broad(api_key, slug)
-    if existing_id:
-        return existing_id, None, True
+    if existing_id: return existing_id, None, True
 
-    # 2. Import
     url = f"https://polymarket.com/event/{slug}"
-    
     for attempt in range(3):
-        r = simmer_request(
-            "/api/sdk/markets/import",
-            method="POST",
-            data={"polymarket_url": url, "shared": True},
-            api_key=api_key,
-            timeout=90
-        )
-        
+        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=90)
         if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
             return r.get("market_id"), None, True
-            
         err = r.get("error") if isinstance(r, dict) else str(r)
-        
-        # Internal Server Error fix
         if "internal server error" in str(err).lower():
             time.sleep(2)
             fallback_id = find_simmer_market_broad(api_key, slug)
-            if fallback_id:
-                return fallback_id, None, True
-            
+            if fallback_id: return fallback_id, None, True
         time.sleep(2)
-
     return None, "import_failed_after_retries", False
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
@@ -377,13 +331,11 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
     for attempt in range(3):
         res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
         if res and res.get("success"): return res
-        
         err_msg = str(res.get("error") if isinstance(res, dict) else res).lower()
         if "market not found" in err_msg or "timeout" in err_msg:
             time.sleep(2)
             continue
         return res
-        
     return {"error": "max_retries_exceeded"}
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
@@ -395,45 +347,91 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
     return min(max_size, bal * smart_pct)
 
 # -----------------------
-# Main cycle
+# Logic: Close & Monitor
 # -----------------------
-def load_state():
-    st = load_json(STATE_PATH, {})
-    if not isinstance(st, dict): st = {}
-    today = now_utc().date().isoformat()
-    if st.get("day") != today:
-        st = {"day": today, "trades": 0, "imports": 0, "last_trade_ts": None}
-    return st
+def get_market_end_time_from_slug(slug: str):
+    # slug: btc-updown-5m-1771263000
+    try:
+        parts = slug.split("-")
+        ts = int(parts[-1])
+        # 5m window end = start + 300s
+        return datetime.fromtimestamp(ts + 300, tz=timezone.utc)
+    except:
+        return None
 
-def save_state(st: dict):
-    save_json(STATE_PATH, st)
+def monitor_and_close(api_key: str, market_id: str, end_time: datetime):
+    """
+    Blocks execution until 10 seconds before end_time, then SELLS.
+    """
+    target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    
+    print(f"MONITOR: Holding active trade until {target_close_time.strftime('%H:%M:%S')} (Buffer: {CLOSE_BUFFER_SECONDS}s)")
+    
+    while True:
+        now = now_utc()
+        if now >= target_close_time:
+            break
+        
+        # Calculate waiting time
+        wait = (target_close_time - now).total_seconds()
+        if wait > 30:
+            print(f"MONITOR: {int(wait)}s remaining...")
+            time.sleep(15)
+        elif wait > 5:
+            time.sleep(5)
+        else:
+            time.sleep(1)
 
-def count_open_fast_positions(positions):
-    # Simplistic count for now
-    n = 0
+    print("MONITOR: Time's up! Closing position to avoid manipulation...")
+    
+    # 1. Fetch current shares
+    positions = get_positions(api_key)
+    my_pos = None
+    for p in positions:
+        if str(p.get("market_id") or p.get("id")) == str(market_id):
+            my_pos = p
+            break
+            
+    if not my_pos:
+        print("MONITOR: Position not found (already closed?).")
+        return
+
+    # 2. Sell everything
+    shares_yes = float(my_pos.get("shares_yes", 0) or 0)
+    shares_no  = float(my_pos.get("shares_no", 0) or 0)
+    
+    if shares_yes > 0:
+        res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+        print(f"CLOSE YES: {res.get('success', False)}")
+    if shares_no > 0:
+        res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
+        print(f"CLOSE NO: {res.get('success', False)}")
+
+def check_safety_close(api_key: str, positions):
+    """
+    On startup, check if any positions are about to expire (<10s) and close them immediately.
+    """
     now = now_utc()
     for p in positions or []:
-        q = (p.get("question") or "").lower()
-        if "up or down" not in q: continue
-        if float(p.get("shares_yes", 0)) <= 0 and float(p.get("shares_no", 0)) <= 0: continue
-        n += 1
-    return n
-
-def already_in_this_market(positions, slug: str, market_id: str = None):
-    # Check by ID if available
-    if market_id:
-        for p in positions or []:
-            if str(p.get("market_id") or p.get("id")) == str(market_id):
-                if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
-                    return True
-    return False
-
-def close_positions(api_key: str, positions, quiet: bool = False):
-    # Close ONLY if we can prove it's expired
-    # (We rely on Simmer/Polymarket to settle, but we can sell if needed)
-    # For this strategy, we usually hold to expiry.
-    # Leaving empty to "Hold to Expiry" as requested initially, unless logic changes.
-    return False
+        slug = p.get("slug")
+        if not slug: continue
+        
+        end_time = get_market_end_time_from_slug(slug)
+        if not end_time: continue
+        
+        seconds_left = (end_time - now).total_seconds()
+        
+        # If active but less than 10s left (or already passed), CLOSE IT.
+        if seconds_left < CLOSE_BUFFER_SECONDS:
+            print(f"SAFETY: Found position {slug} near expiry ({seconds_left:.0f}s left). Closing now.")
+            market_id = p.get("market_id") or p.get("id")
+            shares_yes = float(p.get("shares_yes", 0) or 0)
+            shares_no  = float(p.get("shares_no", 0) or 0)
+            
+            if shares_yes > 0:
+                execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+            if shares_no > 0:
+                execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
@@ -442,57 +440,54 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
+    # 1. Safety Check (Close dangerous positions first)
     positions = get_positions(api_key)
-    # count_open_fast_positions(positions) ... skipped closing for now (Hold-to-expiry)
+    check_safety_close(api_key, positions)
 
+    # 2. Market Discovery
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
     
     if not best:
-        log("SKIP: Time window too close to end or no market generated.", force=True)
+        log("SKIP: Time window too close to end.", force=True)
         return
 
-    # Debug log the target slug we calculated
-    log(f"TARGET: {best['slug']} (Start: {best['start_time'].strftime('%H:%M')})", force=True)
+    log(f"TARGET: {best['slug']} (End: {best['end_time'].strftime('%H:%M')})", force=True)
 
     window_key = market_window_key(best["slug"])
     if has_recent_lock(window_key):
-        log("SKIP: Recent lock for this window.", force=False)
+        log("SKIP: Recent lock.", force=False)
         return
-        
     if already_in_this_market(positions, best["slug"]):
         log("SKIP: Already in this market.", force=True)
         return
 
+    # 3. Signal
     sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
     if not sig or sig.get("error"):
-        log(f"SKIP: signal error -> {sig}", force=True)
+        log(f"SKIP: Signal error -> {sig}", force=True)
         return
 
     mom_pct = sig["momentum_pct"]
     if abs(mom_pct) < float(cfg["min_momentum_pct"]):
-        log(f"SKIP: weak momentum {mom_pct:.3f}%", force=True)
+        log(f"SKIP: Weak momentum {mom_pct:.3f}%", force=True)
         return
 
     side = "yes" if sig["direction"] == "up" else "no"
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
     
     if amount < 1.0:
-        log(f"SKIP: Amount {amount} too small.", force=True)
+        log("SKIP: Amount too small.", force=True)
         return
 
     log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}%", force=True)
     write_lock(window_key, {"status": "pending"})
 
-    # Import
+    # 4. Execution
     market_id, err, imported = import_market(api_key, best["slug"])
     if not market_id:
         log(f"FAIL: Import {err}", force=True)
         clear_lock(window_key)
-        return
-
-    if already_in_this_market(get_positions(api_key), best["slug"], market_id):
-        log("SKIP: Position appeared before trade.", force=True)
         return
 
     if not live:
@@ -504,9 +499,17 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         st["trades"] = int(st.get("trades", 0)) + 1
         st["last_trade_ts"] = now_utc().isoformat()
         save_state(st)
-        log("TRADE: Success", force=True)
-        append_journal({"type": "trade_success", "market_id": market_id, "slug": best["slug"]})
-        write_lock(window_key, {"status": "done", "slug": best["slug"]})
+        log("TRADE: Success. Entering Monitor Mode...", force=True)
+        
+        write_lock(window_key, {"status": "active", "slug": best["slug"]})
+        
+        # 5. BLOCKING MONITOR
+        # The bot will now SLEEP here until 10s before the event ends.
+        monitor_and_close(api_key, market_id, best["end_time"])
+        
+        log("CYCLE COMPLETE: Trade closed.", force=True)
+        write_lock(window_key, {"status": "closed", "slug": best["slug"]})
+        
     else:
         log(f"TRADE: Failed -> {res}", force=True)
         clear_lock(window_key)
