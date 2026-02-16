@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (CoinGecko Version).
+Railway-ready Simmer FastLoop bot (Robust CoinGecko + Retry).
 
 CHANGELOG:
-- ✅ Switched Signal Source to CoinGecko (More reliable on Railway).
-- ✅ Uses 'market_chart' endpoint for 5-minute granularity (via 1-day range).
-- ✅ Keeps strict "Live Window" logic (only trades active events).
-- ✅ Keeps "Expiry Only" close logic (never panic sells future events).
+- ✅ Signal: CoinGecko (reliable).
+- ✅ Execution: Added 3x RETRY logic for trades.
+- ✅ Safety: Checks for min trade size ($1.00) to avoid rejection.
+- ✅ Logging: Prints FULL error message if trade fails.
 """
 
 import os, sys, json, argparse, time
@@ -33,7 +33,6 @@ GAMMA_MARKETS_URL = (
     "?limit=200&closed=false&tag=crypto&order=createdAt&ascending=false"
 )
 
-# Map generic asset names to CoinGecko IDs
 COINGECKO_IDS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
@@ -79,7 +78,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/2.0-coingecko")
+        req_headers.setdefault("User-Agent", "railway-fastloop/2.1")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -95,7 +94,7 @@ def api_request(url, method="GET", data=None, headers=None, timeout=25):
     except HTTPError as e:
         try:
             err = json.loads(e.read().decode("utf-8"))
-            return {"error": err.get("detail", str(e)), "status_code": e.code}
+            return {"error": err.get("detail", str(e)), "status_code": e.code, "body": err}
         except Exception:
             return {"error": str(e), "status_code": e.code}
     except URLError as e:
@@ -160,13 +159,13 @@ def clear_lock(key: str):
 CONFIG_DEFAULTS = {
     "asset": "BTC",
     "window": "5m",
-    "signal_source": "coingecko", # Updated default
+    "signal_source": "coingecko",
     "lookback_minutes": 12,
     "entry_threshold": 0.05,
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
     "min_volume_ratio": 0.15,
-    "max_position": 3.0,
+    "max_position": 5.0, # Increased for safety
     "smart_sizing_pct": 0.05,
     "max_open_fast_positions": 2,
     "cooldown_seconds": 80,
@@ -336,10 +335,6 @@ def market_window_key(question: str) -> str:
 # Signal: CoinGecko
 # -----------------------
 def get_coingecko_momentum(asset: str, lookback_minutes: int):
-    """
-    Fetches market chart data from CoinGecko.
-    'days=1' automatically returns 5-minute interval candles, which is ideal.
-    """
     coin_id = COINGECKO_IDS.get(asset, "bitcoin")
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
     
@@ -350,21 +345,13 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
     if not isinstance(data, dict) or "prices" not in data:
         return {"error": "coingecko_invalid_format", "raw": str(data)[:100]}
 
-    prices = data["prices"] # List of [timestamp_ms, price]
+    prices = data["prices"]
     if not prices or len(prices) < 2:
         return {"error": "coingecko_insufficient_data"}
 
-    # CoinGecko timestamps are ms. We want the last X minutes.
-    # But for momentum, we just need the latest price vs the price 'lookback' ago.
-    # The list is sorted by time.
-    
-    # 1. Get latest price
     latest_ts, latest_price = prices[-1]
-    
-    # 2. Find price ~lookback_minutes ago
     target_ts = latest_ts - (lookback_minutes * 60 * 1000)
     
-    # Find closest candle to target_ts
     past_price = None
     best_diff = float('inf')
     
@@ -374,9 +361,6 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
             best_diff = diff
             past_price = p
         else:
-            # If diff starts increasing, we moved too far back (since we are iterating reversed)
-            # but usually it's safer to just iterate all or scan. 
-            # Given days=1 is ~288 points, full scan is cheap.
             pass
             
     if past_price is None:
@@ -390,7 +374,7 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
         "price_then": past_price,
         "momentum_pct": momentum_pct,
         "direction": direction,
-        "volume_ratio": 1.0, # CG volume granularity is often too coarse for 5m ratio
+        "volume_ratio": 1.0,
         "source": "coingecko"
     }
 
@@ -434,7 +418,25 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
     if action == "sell": payload["shares"] = float(shares or 0)
     else: payload["amount"] = float(amount or 0)
 
-    return simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
+    # Added retry logic here
+    for attempt in range(3):
+        res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
+        
+        # If success, return immediately
+        if res and res.get("success"):
+            return res
+        
+        # If error, check if it's worth retrying
+        err_msg = str(res.get("error") if isinstance(res, dict) else res).lower()
+        if "market not found" in err_msg or "timeout" in err_msg:
+            # wait and retry
+            time.sleep(2)
+            continue
+            
+        # Fatal error (like insufficient funds), return immediately
+        return res
+        
+    return {"error": "max_retries_exceeded"}
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
     if not smart_sizing: return max_size
@@ -553,7 +555,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: already in market", force=True)
         return
 
-    # --- COINGECKO SIGNAL ---
     sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
     if not sig or sig.get("error"):
         log(f"SKIP: signal error -> {sig}", force=True)
@@ -578,6 +579,12 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         buy_price = 1.0 - yes_price
 
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
+    
+    # SAFETY CHECK: Don't send dust
+    if amount < 1.0:
+        log(f"SKIP: amount {amount} too small (<$1)", force=True)
+        return
+
     log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
 
     write_lock(window_key, {"status": "pending"})
@@ -606,7 +613,10 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         write_lock(window_key, {"status": "done", "slug": best["slug"], "market_id": str(market_id)})
     else:
         err2 = res.get("error") if isinstance(res, dict) else "unknown"
-        log(f"TRADE: failed ({err2})", force=True)
+        # Log the full response body if available for debugging
+        full_debug = res if isinstance(res, dict) else str(res)
+        log(f"TRADE: failed -> {full_debug}", force=True)
+        
         if "timed out" in str(err2).lower():
             time.sleep(2)
             positions2 = get_positions(api_key)
