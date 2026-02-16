@@ -466,11 +466,16 @@ def import_market(api_key: str, slug: str):
         timeout=60
     )
     if not isinstance(r, dict) or r.get("error"):
-        return None, (r.get("error") if isinstance(r, dict) else "import failed")
+        return None, (r.get("error") if isinstance(r, dict) else "import failed"), False
+
     status = r.get("status")
-    if status in ("imported", "already_exists"):
-        return r.get("market_id"), None
-    return None, f"unexpected import status: {status}"
+    if status == "imported":
+        return r.get("market_id"), None, True
+    if status == "already_exists":
+        return r.get("market_id"), None, False
+
+    return None, f"unexpected import status: {status}", False
+
 
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
@@ -518,8 +523,10 @@ def load_state():
         st = {}
     today = date.today().isoformat()
     if st.get("day") != today:
-        st = {"day": today, "trades": 0, "last_trade_ts": None}
+        st = {"day": today, "trades": 0, "imports": 0, "last_trade_ts": None}
+    st.setdefault("imports", 0)
     return st
+
 
 
 def save_state(st: dict):
@@ -832,6 +839,11 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             return
 
     log(f"SIGNAL: {side.upper()} | YES=${yes_price:.3f} | mom={sig['momentum_pct']:+.3f}% | vol={sig['volume_ratio']:.2f}x", force=True)
+
+    if int(st.get("imports", 0)) >= int(cfg.get("daily_import_limit", 10)):
+        log(f"SKIP: daily import limit reached ({st.get('imports')} >= {cfg.get('daily_import_limit',10)})", force=True)
+        append_journal({"type":"skip","reason":"daily_import_limit","imports":st.get("imports")})
+        return
 
     market_id, err = import_market(api_key, best["slug"])
     if not market_id:
