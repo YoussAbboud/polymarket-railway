@@ -281,6 +281,80 @@ def parse_fast_market_window_utc(question: str):
     except Exception:
         return None
 
+def parse_iso_dt(s):
+    """Parse ISO8601 string (with or without 'Z') to aware UTC datetime."""
+    if not s:
+        return None
+    try:
+        s = str(s).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def parse_ts_any(v):
+    """Accept numeric seconds/ms, numeric strings, ISO strings, or datetimes -> UTC datetime."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, datetime):
+            return v.astimezone(timezone.utc)
+        iso = parse_iso_dt(v)
+        if iso:
+            return iso
+        ts = float(v)
+        if ts > 1e12:  # ms
+            ts /= 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def gamma_market_window(m: dict):
+    """Return (start_utc, end_utc) for a Gamma market dict, robust across field variants."""
+    if not isinstance(m, dict):
+        return None, None
+
+    start = (
+        parse_iso_dt(m.get("startDateIso"))
+        or parse_iso_dt(m.get("start_date_iso"))
+        or parse_iso_dt(m.get("startDateISO"))
+        or parse_iso_dt(m.get("start_date"))
+    )
+    end = (
+        parse_iso_dt(m.get("endDateIso"))
+        or parse_iso_dt(m.get("end_date_iso"))
+        or parse_iso_dt(m.get("endDateISO"))
+        or parse_iso_dt(m.get("end_date"))
+    )
+
+    # Fallback: numeric fields (seconds or ms)
+    if not start:
+        start = parse_ts_any(m.get("startDate") if "startDate" in m else m.get("start_date"))
+    if not end:
+        end = parse_ts_any(m.get("endDate") if "endDate" in m else m.get("end_date"))
+
+    return start, end
+
+
+def is_live_window(start: datetime, end: datetime, *, grace_before_s: int = 20, grace_after_s: int = 5) -> bool:
+    """True if now is within [start-grace_before, end+grace_after]."""
+    if not start or not end:
+        return False
+    now = now_utc()
+    return (start - timedelta(seconds=grace_before_s)) <= now <= (end + timedelta(seconds=grace_after_s))
+
+
+def has_time_remaining(end: datetime, min_seconds_left: int) -> bool:
+    if not end:
+        return False
+    return (end - now_utc()).total_seconds() >= int(min_seconds_left)
+
 def discover_fast_markets(asset: str, window: str, *, grace_s: int = 20):
     """
     Pull Gamma /markets and return ONLY markets whose window is LIVE right now.
