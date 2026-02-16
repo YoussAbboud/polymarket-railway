@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v5.2 - Panic Close).
+Railway-ready Simmer FastLoop bot (v6.0 - Winrate Fix).
 
-CHANGELOG:
-- ✅ FIX "Close Failed": Implemented 'force_close' with aggressive retries.
-- ✅ DEBUGGING: Prints FULL error message if closing fails.
-- ✅ SAFETY: Will not give up on closing until it tries 5 times or succeeds.
+STRATEGY UPGRADE:
+- ✅ DATA: Switched from CoinGecko (Slow) to Binance (Real-time).
+- ✅ FILTER: Added RSI (Relative Strength Index).
+  -> Prevents buying UP when market is Overbought (>70).
+  -> Prevents buying DOWN when market is Oversold (<30).
+- ✅ EXECUTION: Keeps the Panic Close & Active Monitor logic.
 """
 
 import os, sys, json, argparse, time
@@ -29,19 +31,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # -----------------------
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
 
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-}
-
 TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
-CLOSE_BUFFER_SECONDS = 60   # Close 30s before end
-STOP_LOSS_PCT = 0.05        # -5% Loss
-TAKE_PROFIT_PCT = 0.15      # +15% Profit
+CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
+STOP_LOSS_PCT = 0.25        # WIDENED to -25% (Give trade room to breathe)
+TAKE_PROFIT_PCT = 0.40      # INCREASED to +40% (Catch the big pumps)
 
 # -----------------------
 # Helpers
@@ -71,7 +67,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/5.2")
+        req_headers.setdefault("User-Agent", "railway-fastloop/6.0")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -190,8 +186,8 @@ def already_in_this_market(positions, slug: str, market_id: str = None):
 CONFIG_DEFAULTS = {
     "asset": "BTC",
     "window": "5m",
-    "signal_source": "coingecko",
-    "lookback_minutes": 12,
+    "signal_source": "binance", # Switched default
+    "lookback_minutes": 5, # Tightened to 5m
     "entry_threshold": 0.05,
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
@@ -277,49 +273,86 @@ def market_window_key(slug: str) -> str:
     return slug
 
 # -----------------------
-# Signal
+# Signal: BINANCE + RSI
 # -----------------------
-def get_coingecko_momentum(asset: str, lookback_minutes: int):
-    coin_id = COINGECKO_IDS.get(asset, "bitcoin")
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
-    
-    data = api_request(url, timeout=30)
-    if isinstance(data, dict) and data.get("error"):
-        return {"error": f"coingecko_error: {data.get('error')}"}
-    if not isinstance(data, dict) or "prices" not in data:
-        return {"error": "coingecko_invalid_format", "raw": str(data)[:100]}
-
-    prices = data["prices"]
-    if not prices or len(prices) < 2:
-        return {"error": "coingecko_insufficient_data"}
-
-    latest_ts, latest_price = prices[-1]
-    target_ts = latest_ts - (lookback_minutes * 60 * 1000)
-    
-    past_price = None
-    best_diff = float('inf')
-    
-    for t, p in reversed(prices):
-        diff = abs(t - target_ts)
-        if diff < best_diff:
-            best_diff = diff
-            past_price = p
-        else:
-            pass
-            
-    if past_price is None:
-        return {"error": "coingecko_history_lookup_failed"}
+def calculate_rsi(prices, period=14):
+    """
+    Standard RSI calculation.
+    """
+    if len(prices) < period + 1:
+        return 50.0 # Not enough data
         
-    momentum_pct = ((latest_price - past_price) / past_price) * 100.0
+    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+    
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    if avg_loss == 0:
+        return 100.0
+        
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def get_binance_signal(asset: str, lookback_minutes: int):
+    """
+    Fetches 1m klines from Binance to calculate Momentum AND RSI.
+    """
+    symbol = "BTCUSDT"
+    if asset == "ETH": symbol = "ETHUSDT"
+    if asset == "SOL": symbol = "SOLUSDT"
+
+    # Fetch last 30 minutes of 1m candles
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
+    
+    data = api_request(url, timeout=10)
+    if isinstance(data, dict) and data.get("error"):
+         return {"error": f"binance_error: {data.get('error')}"}
+    if not isinstance(data, list):
+         return {"error": "binance_invalid_format"}
+
+    # Binance Kline: [Open Time, Open, High, Low, Close, Volume, ...]
+    # We only need Close prices (index 4)
+    closes = [float(x[4]) for x in data]
+    
+    if len(closes) < 5:
+        return {"error": "not_enough_binance_data"}
+
+    price_now = closes[-1]
+    
+    # Calculate Momentum (Change from X minutes ago)
+    # lookback_minutes default 5
+    idx_past = max(0, len(closes) - 1 - lookback_minutes)
+    price_then = closes[idx_past]
+    
+    momentum_pct = ((price_now - price_then) / price_then) * 100.0
+    
+    # Calculate RSI (14 period)
+    rsi = calculate_rsi(closes, period=14)
+    
     direction = "up" if momentum_pct > 0 else "down"
+    
+    # --- INTELLIGENT FILTERING ---
+    # Filter 1: RSI Overbought/Oversold Check
+    is_valid = True
+    reason = "ok"
+    
+    if direction == "up" and rsi > 70:
+        is_valid = False
+        reason = f"rsi_overbought ({rsi:.1f})"
+    elif direction == "down" and rsi < 30:
+        is_valid = False
+        reason = f"rsi_oversold ({rsi:.1f})"
 
     return {
-        "price_now": latest_price,
-        "price_then": past_price,
+        "price_now": price_now,
         "momentum_pct": momentum_pct,
         "direction": direction,
-        "volume_ratio": 1.0,
-        "source": "coingecko"
+        "rsi": rsi,
+        "is_valid": is_valid,
+        "filter_reason": reason,
+        "source": "binance"
     }
 
 # -----------------------
@@ -380,25 +413,15 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         return res
     return {"error": "max_retries_exceeded"}
 
-# --- NEW: AGGRESSIVE CLOSE WRAPPER ---
 def force_close_position(api_key: str, market_id: str, side: str, shares: float):
-    """
-    Tries aggressively to close a position.
-    Prints FULL error if it fails.
-    """
     print(f"FORCE CLOSE: Attempting to sell {shares} shares of {side.upper()}...")
-    
     for attempt in range(1, 6): # Try 5 times
         res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
-        
         if res.get("success"):
             print(f"CLOSE SUCCESS: Sold {shares} shares.")
             return True
-        
-        # LOG THE ERROR
         print(f"CLOSE FAILED (Attempt {attempt}/5): {json.dumps(res)}")
-        time.sleep(1.5) # Wait a bit before retry
-        
+        time.sleep(1.5)
     print("CRITICAL: Failed to close position after 5 attempts.")
     return False
 
@@ -432,34 +455,28 @@ def get_market_price(market_id: str):
     return None
 
 def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: str):
-    """
-    Blocks execution until 30 seconds before end_time, CHECKING PnL every 3s.
-    """
     target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
-    # 1. Get baseline position to estimate entry
     print("MONITOR: Fetching initial position details...")
-    time.sleep(2) # Wait for trade to settle
+    time.sleep(2) 
     
     positions = get_positions(api_key)
     my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
     
     if not my_pos:
         print("MONITOR: Position not found (maybe delay?). Will try to track anyway.")
-        entry_price = 0.5 # fallback
+        entry_price = 0.5 
     else:
-        # Try to find avg price
         entry_price = float(my_pos.get("avg_buy_price", 0) or my_pos.get("avg_price", 0) or 0)
         if entry_price <= 0:
-            # Fallback to current market price
             prices = get_market_price(market_id)
             if prices:
                 idx = 0 if side == "yes" else 1
                 entry_price = float(prices[idx])
             else:
-                entry_price = 0.5 # Absolute fallback
+                entry_price = 0.5 
 
-    print(f"MONITOR: Tracking {side.upper()}. Entry Est: {entry_price:.3f}. Holding until {target_close_time.strftime('%H:%M:%S')}")
+    print(f"MONITOR: Tracking {side.upper()}. Entry Est: {entry_price:.3f}. RSI Filter active.")
     
     while True:
         now = now_utc()
@@ -467,7 +484,6 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
             print("MONITOR: Time limit reached (30s buffer).")
             break
             
-        # Check Price & PnL
         prices = get_market_price(market_id)
         if prices and entry_price > 0:
             idx = 0 if side == "yes" else 1
@@ -488,7 +504,6 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
 
     print("MONITOR: Closing position...")
     
-    # Close logic (Updated to use force_close_position)
     positions = get_positions(api_key)
     my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
             
@@ -533,11 +548,9 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
-    # 1. Safety Check
     positions = get_positions(api_key)
     check_safety_close(api_key, positions)
 
-    # 2. Market Discovery
     markets = discover_fast_markets(cfg["asset"], cfg["window"])
     best = select_best_market(markets, int(cfg["min_time_remaining"]))
     
@@ -555,10 +568,16 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: Already in this market.", force=True)
         return
 
-    # 3. Signal
-    sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
+    # --- UPDATED SIGNAL: BINANCE + RSI ---
+    sig = get_binance_signal(cfg["asset"], int(cfg["lookback_minutes"]))
+    
     if not sig or sig.get("error"):
         log(f"SKIP: Signal error -> {sig}", force=True)
+        return
+
+    # Check validity (RSI)
+    if not sig.get("is_valid", True):
+        log(f"SKIP: Filtered by Strategy -> {sig.get('filter_reason', 'unknown')}", force=True)
         return
 
     mom_pct = sig["momentum_pct"]
@@ -568,7 +587,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
 
     side = "yes" if sig["direction"] == "up" else "no"
     
-    # 3b. Price Check for Min Shares
     buy_price = 0.5 
     try:
         prices = json.loads(best.get("outcome_prices", "[]"))
@@ -576,9 +594,13 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
             buy_price = float(prices[0]) if side == "yes" else float(prices[1])
     except: pass
 
+    # ENTRY PRICE CHECK: Don't buy if price > 0.65 (Risk/Reward bad)
+    if buy_price > 0.65:
+         log(f"SKIP: Price {buy_price:.2f} too high/expensive for entry.", force=True)
+         return
+
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
     
-    # Enforce Min Shares (5.0)
     min_shares = 5.0
     estimated_shares = amount / buy_price if buy_price > 0 else 0
     
@@ -594,10 +616,9 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: Amount too small.", force=True)
         return
 
-    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
+    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | RSI={sig.get('rsi', 0):.1f} | Price={buy_price:.2f}", force=True)
     write_lock(window_key, {"status": "pending"})
 
-    # 4. Execution
     market_id, err, imported = import_market(api_key, best["slug"])
     if not market_id:
         log(f"FAIL: Import {err}", force=True)
@@ -616,8 +637,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("TRADE: Success. Entering Monitor Mode...", force=True)
         
         write_lock(window_key, {"status": "active", "slug": best["slug"]})
-        
-        # 5. BLOCKING MONITOR (with SL/TP)
         monitor_and_close(api_key, market_id, best["end_time"], side)
         
         log("CYCLE COMPLETE: Trade closed.", force=True)
