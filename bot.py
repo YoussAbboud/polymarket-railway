@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v4.2 - VERIFIED).
+Railway-ready Simmer FastLoop bot (v5.0 - Active Trader).
 
-FEATURES:
-- ✅ AUTO-SLUG: Calculates correct btc-updown-5m-{timestamp} slugs.
-- ✅ ACTIVE MONITOR: Holds trade open until 10s before expiry.
-- ✅ SNIPER CLOSE: Sells at T-10s to avoid manipulation.
-- ✅ SAFETY: Checks for expiring trades on startup.
-- ✅ ROBUST: Retry logic for imports and trades.
+CHANGELOG:
+- ✅ MONITOR: Closes 30 seconds before expiry (avoid volatility).
+- ✅ STOP LOSS: Instantly closes if PnL <= -15%.
+- ✅ TAKE PROFIT: Instantly closes if PnL >= +30%.
+- ✅ REAL-TIME: Checks price/PnL every 3 seconds while holding.
 """
 
 import os, sys, json, argparse, time
@@ -39,7 +38,11 @@ COINGECKO_IDS = {
 
 TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
-CLOSE_BUFFER_SECONDS = 10  # Seconds before end to close
+
+# --- STRATEGY SETTINGS ---
+CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
+STOP_LOSS_PCT = 0.15        # -15%
+TAKE_PROFIT_PCT = 0.30      # +30%
 
 # -----------------------
 # Helpers
@@ -69,7 +72,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/4.2")
+        req_headers.setdefault("User-Agent", "railway-fastloop/5.0")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -390,53 +393,88 @@ def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_si
 # Logic: Close & Monitor
 # -----------------------
 def get_market_end_time_from_slug(slug: str):
-    # slug: btc-updown-5m-1771263000
     try:
         parts = slug.split("-")
         ts = int(parts[-1])
-        # 5m window end = start + 300s
         return datetime.fromtimestamp(ts + 300, tz=timezone.utc)
     except:
         return None
 
-def monitor_and_close(api_key: str, market_id: str, end_time: datetime):
+def get_market_price(market_id: str):
+    url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+    res = api_request(url, timeout=5)
+    if isinstance(res, dict) and "outcomePrices" in res:
+        try:
+            return json.loads(res["outcomePrices"])
+        except:
+            pass
+    return None
+
+def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: str):
     """
-    Blocks execution until 10 seconds before end_time, then SELLS.
+    Blocks execution until 30 seconds before end_time, CHECKING PnL every 3s.
     """
     target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
-    print(f"MONITOR: Holding active trade until {target_close_time.strftime('%H:%M:%S')} (Buffer: {CLOSE_BUFFER_SECONDS}s)")
+    # 1. Get baseline position to estimate entry
+    print("MONITOR: Fetching initial position details...")
+    time.sleep(2) # Wait for trade to settle
+    
+    positions = get_positions(api_key)
+    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
+    
+    if not my_pos:
+        print("MONITOR: Position not found (maybe delay?). Will try to track anyway.")
+        entry_price = 0.5 # fallback
+    else:
+        # Try to find avg price
+        entry_price = float(my_pos.get("avg_buy_price", 0) or my_pos.get("avg_price", 0) or 0)
+        if entry_price <= 0:
+            # Fallback to current market price
+            prices = get_market_price(market_id)
+            if prices:
+                idx = 0 if side == "yes" else 1
+                entry_price = float(prices[idx])
+            else:
+                entry_price = 0.5 # Absolute fallback
+
+    print(f"MONITOR: Tracking {side.upper()}. Entry Est: {entry_price:.3f}. Holding until {target_close_time.strftime('%H:%M:%S')}")
     
     while True:
         now = now_utc()
         if now >= target_close_time:
-            break
-        
-        # Calculate waiting time
-        wait = (target_close_time - now).total_seconds()
-        if wait > 30:
-            print(f"MONITOR: {int(wait)}s remaining...")
-            time.sleep(15)
-        elif wait > 5:
-            time.sleep(5)
-        else:
-            time.sleep(1)
-
-    print("MONITOR: Time's up! Closing position to avoid manipulation...")
-    
-    # 1. Fetch current shares
-    positions = get_positions(api_key)
-    my_pos = None
-    for p in positions:
-        if str(p.get("market_id") or p.get("id")) == str(market_id):
-            my_pos = p
+            print("MONITOR: Time limit reached (30s buffer).")
             break
             
+        # Check Price & PnL
+        prices = get_market_price(market_id)
+        if prices and entry_price > 0:
+            idx = 0 if side == "yes" else 1
+            curr_price = float(prices[idx])
+            
+            pnl = (curr_price - entry_price) / entry_price
+            
+            print(f"MONITOR: {side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}% | Time left: {(target_close_time - now).total_seconds():.0f}s")
+            
+            if pnl <= -STOP_LOSS_PCT:
+                print(f"!!! STOP LOSS TRIGGERED ({pnl*100:.1f}%) !!! Closing...")
+                break
+            if pnl >= TAKE_PROFIT_PCT:
+                print(f"!!! TAKE PROFIT TRIGGERED ({pnl*100:.1f}%) !!! Closing...")
+                break
+        
+        time.sleep(3)
+
+    print("MONITOR: Closing position...")
+    
+    # Close
+    positions = get_positions(api_key)
+    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
+            
     if not my_pos:
-        print("MONITOR: Position not found (already closed?).")
+        print("MONITOR: Position gone. Already closed?")
         return
 
-    # 2. Sell everything
     shares_yes = float(my_pos.get("shares_yes", 0) or 0)
     shares_no  = float(my_pos.get("shares_no", 0) or 0)
     
@@ -448,9 +486,6 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime):
         print(f"CLOSE NO: {res.get('success', False)}")
 
 def check_safety_close(api_key: str, positions):
-    """
-    On startup, check if any positions are about to expire (<10s) and close them immediately.
-    """
     now = now_utc()
     for p in positions or []:
         slug = p.get("slug")
@@ -461,7 +496,6 @@ def check_safety_close(api_key: str, positions):
         
         seconds_left = (end_time - now).total_seconds()
         
-        # If active but less than 10s left (or already passed), CLOSE IT.
         if seconds_left < CLOSE_BUFFER_SECONDS:
             print(f"SAFETY: Found position {slug} near expiry ({seconds_left:.0f}s left). Closing now.")
             market_id = p.get("market_id") or p.get("id")
@@ -480,7 +514,7 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     api_key = get_api_key()
     st = load_state()
 
-    # 1. Safety Check (Close dangerous positions first)
+    # 1. Safety Check
     positions = get_positions(api_key)
     check_safety_close(api_key, positions)
 
@@ -514,13 +548,34 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         return
 
     side = "yes" if sig["direction"] == "up" else "no"
+    
+    # 3b. Price Check for Min Shares
+    buy_price = 0.5 
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        if prices and len(prices) >= 2:
+            buy_price = float(prices[0]) if side == "yes" else float(prices[1])
+    except: pass
+
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
     
+    # Enforce Min Shares (5.0)
+    min_shares = 5.0
+    estimated_shares = amount / buy_price if buy_price > 0 else 0
+    
+    if estimated_shares < min_shares:
+        required_amount = (min_shares * buy_price) * 1.05
+        if required_amount > float(cfg["max_position"]) * 3:
+            log(f"SKIP: Required amount ${required_amount:.2f} too high.", force=True)
+            return
+        log(f"ADJUST: Bumping amount to ${required_amount:.2f} to meet 5 share min.")
+        amount = required_amount
+
     if amount < 1.0:
         log("SKIP: Amount too small.", force=True)
         return
 
-    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}%", force=True)
+    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
     write_lock(window_key, {"status": "pending"})
 
     # 4. Execution
@@ -543,9 +598,8 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         
         write_lock(window_key, {"status": "active", "slug": best["slug"]})
         
-        # 5. BLOCKING MONITOR
-        # The bot will now SLEEP here until 10s before the event ends.
-        monitor_and_close(api_key, market_id, best["end_time"])
+        # 5. BLOCKING MONITOR (with SL/TP)
+        monitor_and_close(api_key, market_id, best["end_time"], side)
         
         log("CYCLE COMPLETE: Trade closed.", force=True)
         write_lock(window_key, {"status": "closed", "slug": best["slug"]})
