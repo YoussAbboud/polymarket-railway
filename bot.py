@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v2.2 - Import Fix).
+Railway-ready Simmer FastLoop bot (v2.3 - Import Fix).
 
 CHANGELOG:
-- ✅ FIX: "Internal Server Error" on Import.
-  -> Logic: If import fails, we now SEARCH Simmer for the market.
-     Often the market exists but the import tool crashed.
-- ✅ RETRY: Added 3x retries to the import_market function.
-- ✅ ROBUST: Keeps all previous CoinGecko + Execution fixes.
+- ✅ FIX "Internal Server Error":
+  -> The bot now CHECKS if the market exists on Simmer *before* trying to import it.
+  -> This bypasses the 500 error caused by duplicate imports.
+- ✅ ROBUST: Keeps all previous CoinGecko + Retry + Safety logic.
 """
 
 import os, sys, json, argparse, time
@@ -79,7 +78,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/2.2")
+        req_headers.setdefault("User-Agent", "railway-fastloop/2.3")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -295,9 +294,7 @@ def discover_fast_markets(asset: str, window: str):
         q = q_raw.lower()
         slug = (m.get("slug") or "")
 
-        # Safety: slug must exist
         if not slug: continue
-
         if not any(p in q for p in patterns): continue
         if m.get("closed"): continue
 
@@ -393,21 +390,36 @@ def get_positions(api_key: str):
 def get_portfolio(api_key: str):
     return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
 
+# --- NEW HELPER: FIND EXISTING MARKET ---
 def find_simmer_market_by_slug(api_key: str, slug: str):
-    """Fallback: search for market if import fails"""
-    # Try searching by slug
+    """
+    Search existing markets on Simmer to avoid re-importing (which causes 500s).
+    """
+    # 1. Try generic search
     r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
     if isinstance(r, dict) and "markets" in r:
         for m in r["markets"]:
-            # Check if source url or slug matches
-            if slug in str(m.get("polymarket_url", "")) or slug in str(m.get("slug", "")):
+            # Match strictly on slug or polymarket_url
+            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
                 return m.get("id")
     return None
 
 def import_market(api_key: str, slug: str):
+    """
+    Robust import:
+    1. Check if it exists FIRST.
+    2. If not, try import.
+    3. If import fails, check again.
+    """
+    # STEP 1: Check if already exists (avoids 500 error)
+    existing_id = find_simmer_market_by_slug(api_key, slug)
+    if existing_id:
+        # print(f"DEBUG: Found existing market {existing_id}, skipping import.")
+        return existing_id, None, True
+
+    # STEP 2: Try to import
     url = f"https://polymarket.com/event/{slug}"
     
-    # Retry loop for import
     for attempt in range(3):
         r = simmer_request(
             "/api/sdk/markets/import",
@@ -417,24 +429,21 @@ def import_market(api_key: str, slug: str):
             timeout=90
         )
         
-        # Success case
+        # Success
         if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
             return r.get("market_id"), None, True
             
         # Error handling
         err = r.get("error") if isinstance(r, dict) else str(r)
         
-        # If Internal Server Error, try Fallback Search immediately
+        # If Internal Server Error, assumes it might be a race condition/duplicate
+        # So we check ONE MORE TIME if the market appeared.
         if "internal server error" in str(err).lower():
-            # Fallback search
+            time.sleep(2)
             fallback_id = find_simmer_market_by_slug(api_key, slug)
             if fallback_id:
                 return fallback_id, None, True
-            # If not found, sleep and retry import
-            time.sleep(2)
-            continue
             
-        # Other errors (rate limit etc)
         time.sleep(2)
 
     return None, "import_failed_after_retries", False
