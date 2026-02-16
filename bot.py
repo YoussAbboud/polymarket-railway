@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v5.0 - Active Trader).
+Railway-ready Simmer FastLoop bot (v5.2 - Panic Close).
 
 CHANGELOG:
-- ✅ MONITOR: Closes 30 seconds before expiry (avoid volatility).
-- ✅ STOP LOSS: Instantly closes if PnL <= -15%.
-- ✅ TAKE PROFIT: Instantly closes if PnL >= +30%.
-- ✅ REAL-TIME: Checks price/PnL every 3 seconds while holding.
+- ✅ FIX "Close Failed": Implemented 'force_close' with aggressive retries.
+- ✅ DEBUGGING: Prints FULL error message if closing fails.
+- ✅ SAFETY: Will not give up on closing until it tries 5 times or succeeds.
 """
 
 import os, sys, json, argparse, time
@@ -41,8 +40,8 @@ LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
 CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
-STOP_LOSS_PCT = 0.15        # -15%
-TAKE_PROFIT_PCT = 0.15      # +15%
+STOP_LOSS_PCT = 0.05        # -5% Loss
+TAKE_PROFIT_PCT = 0.15      # +15% Profit
 
 # -----------------------
 # Helpers
@@ -72,7 +71,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/5.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/5.2")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -381,6 +380,28 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         return res
     return {"error": "max_retries_exceeded"}
 
+# --- NEW: AGGRESSIVE CLOSE WRAPPER ---
+def force_close_position(api_key: str, market_id: str, side: str, shares: float):
+    """
+    Tries aggressively to close a position.
+    Prints FULL error if it fails.
+    """
+    print(f"FORCE CLOSE: Attempting to sell {shares} shares of {side.upper()}...")
+    
+    for attempt in range(1, 6): # Try 5 times
+        res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
+        
+        if res.get("success"):
+            print(f"CLOSE SUCCESS: Sold {shares} shares.")
+            return True
+        
+        # LOG THE ERROR
+        print(f"CLOSE FAILED (Attempt {attempt}/5): {json.dumps(res)}")
+        time.sleep(1.5) # Wait a bit before retry
+        
+    print("CRITICAL: Failed to close position after 5 attempts.")
+    return False
+
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
     if not smart_sizing: return max_size
     pf = get_portfolio(api_key)
@@ -467,7 +488,7 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
 
     print("MONITOR: Closing position...")
     
-    # Close
+    # Close logic (Updated to use force_close_position)
     positions = get_positions(api_key)
     my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
             
@@ -479,11 +500,9 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
     shares_no  = float(my_pos.get("shares_no", 0) or 0)
     
     if shares_yes > 0:
-        res = execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
-        print(f"CLOSE YES: {res.get('success', False)}")
+        force_close_position(api_key, market_id, "yes", shares_yes)
     if shares_no > 0:
-        res = execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
-        print(f"CLOSE NO: {res.get('success', False)}")
+        force_close_position(api_key, market_id, "no", shares_no)
 
 def check_safety_close(api_key: str, positions):
     now = now_utc()
@@ -503,9 +522,9 @@ def check_safety_close(api_key: str, positions):
             shares_no  = float(p.get("shares_no", 0) or 0)
             
             if shares_yes > 0:
-                execute_trade(api_key, market_id, "yes", shares=shares_yes, action="sell")
+                force_close_position(api_key, market_id, "yes", shares_yes)
             if shares_no > 0:
-                execute_trade(api_key, market_id, "no", shares=shares_no, action="sell")
+                force_close_position(api_key, market_id, "no", shares_no)
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
