@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v4.0 - Active Monitor & Auto-Close).
+Railway-ready Simmer FastLoop bot (v4.1 - Fix Missing Helpers).
 
 CHANGELOG:
-- ✅ ACTIVE MONITOR: After buying, the bot WAITS until 10s before expiry.
-- ✅ AUTO-CLOSE: At T-10s, it automatically sells the position to avoid manipulation.
-- ✅ SAFETY NET: On startup, checks for any positions <10s from expiry and closes them.
+- ✅ FIX CRASH: Restored missing 'load_state' and 'save_state' functions.
+- ✅ ACTIVE MONITOR: Waits until 10s before expiry.
+- ✅ AUTO-CLOSE: Sells at T-10s to avoid manipulation.
 """
 
 import os, sys, json, argparse, time
@@ -67,7 +67,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/4.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/4.1")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -141,6 +141,20 @@ def clear_lock(key: str):
     try:
         if os.path.exists(path): os.remove(path)
     except Exception: pass
+
+# -----------------------
+# State helpers (RESTORED)
+# -----------------------
+def load_state():
+    st = load_json(STATE_PATH, {})
+    if not isinstance(st, dict): st = {}
+    today = now_utc().date().isoformat()
+    if st.get("day") != today:
+        st = {"day": today, "trades": 0, "imports": 0, "last_trade_ts": None}
+    return st
+
+def save_state(st: dict):
+    save_json(STATE_PATH, st)
 
 # -----------------------
 # Config
