@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (Robust CoinGecko + Retry).
+Railway-ready Simmer FastLoop bot (v2.2 - Import Fix).
 
 CHANGELOG:
-- ✅ Signal: CoinGecko (reliable).
-- ✅ Execution: Added 3x RETRY logic for trades.
-- ✅ Safety: Checks for min trade size ($1.00) to avoid rejection.
-- ✅ Logging: Prints FULL error message if trade fails.
+- ✅ FIX: "Internal Server Error" on Import.
+  -> Logic: If import fails, we now SEARCH Simmer for the market.
+     Often the market exists but the import tool crashed.
+- ✅ RETRY: Added 3x retries to the import_market function.
+- ✅ ROBUST: Keeps all previous CoinGecko + Execution fixes.
 """
 
 import os, sys, json, argparse, time
@@ -78,7 +79,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/2.1")
+        req_headers.setdefault("User-Agent", "railway-fastloop/2.2")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -165,7 +166,7 @@ CONFIG_DEFAULTS = {
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
     "min_volume_ratio": 0.15,
-    "max_position": 5.0, # Increased for safety
+    "max_position": 5.0, 
     "smart_sizing_pct": 0.05,
     "max_open_fast_positions": 2,
     "cooldown_seconds": 80,
@@ -278,7 +279,6 @@ def gamma_market_window(m: dict):
         except: pass
     return start, end
 
-# STRICTLY ENSURES WE ARE WITHIN THE BOUNDS OF THE LIVE MARKET
 def is_live_window(start: datetime, end: datetime) -> bool:
     if not start or not end: return False
     now = now_utc()
@@ -294,6 +294,9 @@ def discover_fast_markets(asset: str, window: str):
         q_raw = (m.get("question") or "")
         q = q_raw.lower()
         slug = (m.get("slug") or "")
+
+        # Safety: slug must exist
+        if not slug: continue
 
         if not any(p in q for p in patterns): continue
         if m.get("closed"): continue
@@ -390,22 +393,51 @@ def get_positions(api_key: str):
 def get_portfolio(api_key: str):
     return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
 
+def find_simmer_market_by_slug(api_key: str, slug: str):
+    """Fallback: search for market if import fails"""
+    # Try searching by slug
+    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
+    if isinstance(r, dict) and "markets" in r:
+        for m in r["markets"]:
+            # Check if source url or slug matches
+            if slug in str(m.get("polymarket_url", "")) or slug in str(m.get("slug", "")):
+                return m.get("id")
+    return None
+
 def import_market(api_key: str, slug: str):
     url = f"https://polymarket.com/event/{slug}"
-    r = simmer_request(
-        "/api/sdk/markets/import",
-        method="POST",
-        data={"polymarket_url": url, "shared": True},
-        api_key=api_key,
-        timeout=90
-    )
-    if not isinstance(r, dict) or r.get("error"):
-        return None, (r.get("error") if isinstance(r, dict) else "import failed"), False
+    
+    # Retry loop for import
+    for attempt in range(3):
+        r = simmer_request(
+            "/api/sdk/markets/import",
+            method="POST",
+            data={"polymarket_url": url, "shared": True},
+            api_key=api_key,
+            timeout=90
+        )
+        
+        # Success case
+        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
+            return r.get("market_id"), None, True
+            
+        # Error handling
+        err = r.get("error") if isinstance(r, dict) else str(r)
+        
+        # If Internal Server Error, try Fallback Search immediately
+        if "internal server error" in str(err).lower():
+            # Fallback search
+            fallback_id = find_simmer_market_by_slug(api_key, slug)
+            if fallback_id:
+                return fallback_id, None, True
+            # If not found, sleep and retry import
+            time.sleep(2)
+            continue
+            
+        # Other errors (rate limit etc)
+        time.sleep(2)
 
-    status = r.get("status")
-    if status == "imported": return r.get("market_id"), None, True
-    if status == "already_exists": return r.get("market_id"), None, False
-    return None, f"unexpected import status: {status}", False
+    return None, "import_failed_after_retries", False
 
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     payload = {
@@ -418,22 +450,14 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
     if action == "sell": payload["shares"] = float(shares or 0)
     else: payload["amount"] = float(amount or 0)
 
-    # Added retry logic here
     for attempt in range(3):
         res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
+        if res and res.get("success"): return res
         
-        # If success, return immediately
-        if res and res.get("success"):
-            return res
-        
-        # If error, check if it's worth retrying
         err_msg = str(res.get("error") if isinstance(res, dict) else res).lower()
         if "market not found" in err_msg or "timeout" in err_msg:
-            # wait and retry
             time.sleep(2)
             continue
-            
-        # Fatal error (like insufficient funds), return immediately
         return res
         
     return {"error": "max_retries_exceeded"}
@@ -579,8 +603,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         buy_price = 1.0 - yes_price
 
     amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
-    
-    # SAFETY CHECK: Don't send dust
     if amount < 1.0:
         log(f"SKIP: amount {amount} too small (<$1)", force=True)
         return
@@ -613,7 +635,6 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         write_lock(window_key, {"status": "done", "slug": best["slug"], "market_id": str(market_id)})
     else:
         err2 = res.get("error") if isinstance(res, dict) else "unknown"
-        # Log the full response body if available for debugging
         full_debug = res if isinstance(res, dict) else str(res)
         log(f"TRADE: failed -> {full_debug}", force=True)
         
