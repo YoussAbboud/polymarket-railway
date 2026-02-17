@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v5.5 - PARANOID CLOSER).
+Railway-ready Simmer FastLoop bot (v5.7 - Binance Speed).
 
 CHANGELOG:
-- ✅ PARANOID CLOSE: Never assumes a trade is closed. Checks wallet repeatedly.
-  -> If shares remain > 0, it retries the sell loop infinitely.
-- ✅ HARD PROFIT: Instantly closes if PnL > 80% (Secure the bag).
-- ✅ STRATEGY: CoinGecko Momentum (Simple Trend) + High Frequency Monitor.
+- ✅ DATA SOURCE: Switched to BINANCE (Real-time).
+  -> Replaces CoinGecko (laggy) with Binance API (instant).
+- ✅ STRATEGY: Simple Momentum (Price Now vs Price 5 mins ago).
+  -> No RSI filter (as requested, sticking to pure trend).
+- ✅ EXECUTION: Paranoid Closer (Checks wallet until 0 shares remain).
 """
 
 import os, sys, json, argparse, time
@@ -30,19 +31,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # -----------------------
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
 
-COINGECKO_IDS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "SOL": "solana",
-}
-
 TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
 CLOSE_BUFFER_SECONDS = 80   # Close 80s before end
-STOP_LOSS_PCT = 0.05        # -5% Loss
-TAKE_PROFIT_PCT = 0.15      # +15% Profit (Secure the bag early)
+STOP_LOSS_PCT = 0.05        # -05% Loss
+TAKE_PROFIT_PCT = 0.15      # +15% Profit
 
 # -----------------------
 # Helpers
@@ -72,7 +67,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/5.5")
+        req_headers.setdefault("User-Agent", "railway-fastloop/5.7")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -191,8 +186,8 @@ def already_in_this_market(positions, slug: str, market_id: str = None):
 CONFIG_DEFAULTS = {
     "asset": "BTC",
     "window": "5m",
-    "signal_source": "coingecko",
-    "lookback_minutes": 12,
+    "signal_source": "binance", # Switched to Binance
+    "lookback_minutes": 5, # Faster lookback for sharper signals
     "entry_threshold": 0.05,
     "min_momentum_pct": 0.08, 
     "min_time_remaining": 45,
@@ -278,49 +273,42 @@ def market_window_key(slug: str) -> str:
     return slug
 
 # -----------------------
-# Signal: COINGECKO (Stable)
+# Signal: BINANCE MOMENTUM (Simple & Fast)
 # -----------------------
-def get_coingecko_momentum(asset: str, lookback_minutes: int):
-    coin_id = COINGECKO_IDS.get(asset, "bitcoin")
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+def get_binance_momentum(asset: str, lookback_minutes: int):
+    symbol = "BTCUSDT"
+    if asset == "ETH": symbol = "ETHUSDT"
+    if asset == "SOL": symbol = "SOLUSDT"
+
+    # Fetch last 30 minutes of 1m candles
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30"
     
-    data = api_request(url, timeout=30)
+    data = api_request(url, timeout=10)
     if isinstance(data, dict) and data.get("error"):
-        return {"error": f"coingecko_error: {data.get('error')}"}
-    if not isinstance(data, dict) or "prices" not in data:
-        return {"error": "coingecko_invalid_format", "raw": str(data)[:100]}
+         return {"error": f"binance_error: {data.get('error')}"}
+    if not isinstance(data, list):
+         return {"error": "binance_invalid_format"}
 
-    prices = data["prices"]
-    if not prices or len(prices) < 2:
-        return {"error": "coingecko_insufficient_data"}
+    # Binance Kline: [Open Time, Open, High, Low, Close, Volume, ...]
+    closes = [float(x[4]) for x in data]
+    
+    if len(closes) < 5:
+        return {"error": "not_enough_binance_data"}
 
-    latest_ts, latest_price = prices[-1]
-    target_ts = latest_ts - (lookback_minutes * 60 * 1000)
+    price_now = closes[-1]
     
-    past_price = None
-    best_diff = float('inf')
+    # Simple Momentum: Compare now vs X mins ago
+    idx_past = max(0, len(closes) - 1 - lookback_minutes)
+    price_then = closes[idx_past]
     
-    for t, p in reversed(prices):
-        diff = abs(t - target_ts)
-        if diff < best_diff:
-            best_diff = diff
-            past_price = p
-        else:
-            pass
-            
-    if past_price is None:
-        return {"error": "coingecko_history_lookup_failed"}
-        
-    momentum_pct = ((latest_price - past_price) / past_price) * 100.0
+    momentum_pct = ((price_now - price_then) / price_then) * 100.0
     direction = "up" if momentum_pct > 0 else "down"
 
     return {
-        "price_now": latest_price,
-        "price_then": past_price,
+        "price_now": price_now,
         "momentum_pct": momentum_pct,
         "direction": direction,
-        "volume_ratio": 1.0,
-        "source": "coingecko"
+        "source": "binance"
     }
 
 # -----------------------
@@ -538,4 +526,96 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: Time window too close to end.", force=True)
         return
 
-    log(f"TARGET: {best['slug']} (End: {best['end_
+    log(f"TARGET: {best['slug']} (End: {best['end_time'].strftime('%H:%M')})", force=True)
+
+    window_key = market_window_key(best["slug"])
+    if has_recent_lock(window_key):
+        log("SKIP: Recent lock.", force=False)
+        return
+    if already_in_this_market(positions, best["slug"]):
+        log("SKIP: Already in this market.", force=True)
+        return
+
+    # 3. Signal: BINANCE (NEW)
+    sig = get_binance_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
+    
+    if not sig or sig.get("error"):
+        log(f"SKIP: Signal error -> {sig}", force=True)
+        return
+
+    mom_pct = sig["momentum_pct"]
+    if abs(mom_pct) < float(cfg["min_momentum_pct"]):
+        log(f"SKIP: Weak momentum {mom_pct:.3f}%", force=True)
+        return
+
+    side = "yes" if sig["direction"] == "up" else "no"
+    
+    # 3b. Price Check for Min Shares
+    buy_price = 0.5 
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        if prices and len(prices) >= 2:
+            buy_price = float(prices[0]) if side == "yes" else float(prices[1])
+    except: pass
+    
+    if buy_price > 0.65:
+         log(f"SKIP: Price {buy_price:.2f} too high/expensive for entry.", force=True)
+         return
+
+    amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
+    
+    min_shares = 5.0
+    estimated_shares = amount / buy_price if buy_price > 0 else 0
+    
+    if estimated_shares < min_shares:
+        required_amount = (min_shares * buy_price) * 1.05
+        if required_amount > float(cfg["max_position"]) * 3:
+            log(f"SKIP: Required amount ${required_amount:.2f} too high.", force=True)
+            return
+        log(f"ADJUST: Bumping amount to ${required_amount:.2f} to meet 5 share min.")
+        amount = required_amount
+
+    if amount < 1.0:
+        log("SKIP: Amount too small.", force=True)
+        return
+
+    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
+    write_lock(window_key, {"status": "pending"})
+
+    # 4. Execution
+    market_id, err, imported = import_market(api_key, best["slug"])
+    if not market_id:
+        log(f"FAIL: Import {err}", force=True)
+        clear_lock(window_key)
+        return
+
+    if not live:
+        log(f"DRY RUN: Buy {side} ${amount}", force=True)
+        return
+
+    res = execute_trade(api_key, market_id, side, amount=amount)
+    if res and res.get("success"):
+        st["trades"] = int(st.get("trades", 0)) + 1
+        st["last_trade_ts"] = now_utc().isoformat()
+        save_state(st)
+        log("TRADE: Success. Entering Monitor Mode...", force=True)
+        
+        write_lock(window_key, {"status": "active", "slug": best["slug"]})
+        monitor_and_close(api_key, market_id, best["end_time"], side)
+        
+        log("CYCLE COMPLETE: Trade closed.", force=True)
+        write_lock(window_key, {"status": "closed", "slug": best["slug"]})
+        
+    else:
+        log(f"TRADE: Failed -> {res}", force=True)
+        clear_lock(window_key)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--live", action="store_true", help="Execute real trades (default dry-run)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Only output signal/errors")
+    parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio based sizing")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    run_once(cfg, live=args.live, quiet=args.quiet, smart_sizing=args.smart_sizing)
