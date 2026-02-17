@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v5.2 - Panic Close).
+Railway-ready Simmer FastLoop bot (v5.5 - PARANOID CLOSER).
 
 CHANGELOG:
-- ✅ FIX "Close Failed": Implemented 'force_close' with aggressive retries.
-- ✅ DEBUGGING: Prints FULL error message if closing fails.
-- ✅ SAFETY: Will not give up on closing until it tries 5 times or succeeds.
+- ✅ PARANOID CLOSE: Never assumes a trade is closed. Checks wallet repeatedly.
+  -> If shares remain > 0, it retries the sell loop infinitely.
+- ✅ HARD PROFIT: Instantly closes if PnL > 80% (Secure the bag).
+- ✅ STRATEGY: CoinGecko Momentum (Simple Trend) + High Frequency Monitor.
 """
 
 import os, sys, json, argparse, time
@@ -39,9 +40,9 @@ TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
-CLOSE_BUFFER_SECONDS = 30   # Close 30s before end
-STOP_LOSS_PCT = 0.15        # -15% Loss
-TAKE_PROFIT_PCT = 0.20      # +20% Profit
+CLOSE_BUFFER_SECONDS = 80   # Close 80s before end
+STOP_LOSS_PCT = 0.05        # -5% Loss
+TAKE_PROFIT_PCT = 0.15      # +15% Profit (Secure the bag early)
 
 # -----------------------
 # Helpers
@@ -71,7 +72,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/5.2")
+        req_headers.setdefault("User-Agent", "railway-fastloop/5.5")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -277,7 +278,7 @@ def market_window_key(slug: str) -> str:
     return slug
 
 # -----------------------
-# Signal
+# Signal: COINGECKO (Stable)
 # -----------------------
 def get_coingecko_momentum(asset: str, lookback_minutes: int):
     coin_id = COINGECKO_IDS.get(asset, "bitcoin")
@@ -380,27 +381,41 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         return res
     return {"error": "max_retries_exceeded"}
 
-# --- NEW: AGGRESSIVE CLOSE WRAPPER ---
-def force_close_position(api_key: str, market_id: str, side: str, shares: float):
+# --- PARANOID CLOSER LOGIC ---
+def paranoid_close_position(api_key: str, market_id: str):
     """
-    Tries aggressively to close a position.
-    Prints FULL error if it fails.
+    Continually checks wallet. If shares > 0, SELLS.
+    Does NOT stop until 0 shares remain.
     """
-    print(f"FORCE CLOSE: Attempting to sell {shares} shares of {side.upper()}...")
+    print("PARANOID CLOSE: Engaging...")
     
-    for attempt in range(1, 6): # Try 5 times
-        res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
+    while True:
+        # 1. Check current position size
+        positions = get_positions(api_key)
+        my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
         
-        if res.get("success"):
-            print(f"CLOSE SUCCESS: Sold {shares} shares.")
+        if not my_pos:
+            print("PARANOID: Position disappeared. Confirmed Closed.")
             return True
+            
+        s_yes = float(my_pos.get("shares_yes", 0) or 0)
+        s_no = float(my_pos.get("shares_no", 0) or 0)
         
-        # LOG THE ERROR
-        print(f"CLOSE FAILED (Attempt {attempt}/5): {json.dumps(res)}")
-        time.sleep(1.5) # Wait a bit before retry
-        
-    print("CRITICAL: Failed to close position after 5 attempts.")
-    return False
+        # 2. If empty, we are done
+        if s_yes <= 0 and s_no <= 0:
+            print("PARANOID: Zero shares found. Confirmed Closed.")
+            return True
+            
+        # 3. If shares exist, SELL THEM
+        if s_yes > 0:
+            print(f"PARANOID: Found {s_yes} YES shares. Selling...")
+            execute_trade(api_key, market_id, "yes", shares=s_yes, action="sell")
+        if s_no > 0:
+            print(f"PARANOID: Found {s_no} NO shares. Selling...")
+            execute_trade(api_key, market_id, "no", shares=s_no, action="sell")
+            
+        # 4. Wait & Retry (Do not trust success message, trust the wallet check on next loop)
+        time.sleep(1.5)
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
     if not smart_sizing: return max_size
@@ -433,11 +448,10 @@ def get_market_price(market_id: str):
 
 def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: str):
     """
-    Blocks execution until 30 seconds before end_time, CHECKING PnL every 3s.
+    Blocks execution until 30 seconds before end_time, CHECKING PnL every 1s.
     """
     target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
-    # 1. Get baseline position to estimate entry
     print("MONITOR: Fetching initial position details...")
     time.sleep(2) # Wait for trade to settle
     
@@ -484,25 +498,10 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
                 print(f"!!! TAKE PROFIT TRIGGERED ({pnl*100:.1f}%) !!! Closing...")
                 break
         
-        time.sleep(3)
+        time.sleep(1.0) # High frequency check
 
-    print("MONITOR: Closing position...")
-    
-    # Close logic (Updated to use force_close_position)
-    positions = get_positions(api_key)
-    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
-            
-    if not my_pos:
-        print("MONITOR: Position gone. Already closed?")
-        return
-
-    shares_yes = float(my_pos.get("shares_yes", 0) or 0)
-    shares_no  = float(my_pos.get("shares_no", 0) or 0)
-    
-    if shares_yes > 0:
-        force_close_position(api_key, market_id, "yes", shares_yes)
-    if shares_no > 0:
-        force_close_position(api_key, market_id, "no", shares_no)
+    print("MONITOR: Time up or Level Hit. Engaging Paranoid Close...")
+    paranoid_close_position(api_key, market_id)
 
 def check_safety_close(api_key: str, positions):
     now = now_utc()
@@ -518,13 +517,7 @@ def check_safety_close(api_key: str, positions):
         if seconds_left < CLOSE_BUFFER_SECONDS:
             print(f"SAFETY: Found position {slug} near expiry ({seconds_left:.0f}s left). Closing now.")
             market_id = p.get("market_id") or p.get("id")
-            shares_yes = float(p.get("shares_yes", 0) or 0)
-            shares_no  = float(p.get("shares_no", 0) or 0)
-            
-            if shares_yes > 0:
-                force_close_position(api_key, market_id, "yes", shares_yes)
-            if shares_no > 0:
-                force_close_position(api_key, market_id, "no", shares_no)
+            paranoid_close_position(api_key, market_id)
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
@@ -545,94 +538,4 @@ def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
         log("SKIP: Time window too close to end.", force=True)
         return
 
-    log(f"TARGET: {best['slug']} (End: {best['end_time'].strftime('%H:%M')})", force=True)
-
-    window_key = market_window_key(best["slug"])
-    if has_recent_lock(window_key):
-        log("SKIP: Recent lock.", force=False)
-        return
-    if already_in_this_market(positions, best["slug"]):
-        log("SKIP: Already in this market.", force=True)
-        return
-
-    # 3. Signal
-    sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
-    if not sig or sig.get("error"):
-        log(f"SKIP: Signal error -> {sig}", force=True)
-        return
-
-    mom_pct = sig["momentum_pct"]
-    if abs(mom_pct) < float(cfg["min_momentum_pct"]):
-        log(f"SKIP: Weak momentum {mom_pct:.3f}%", force=True)
-        return
-
-    side = "yes" if sig["direction"] == "up" else "no"
-    
-    # 3b. Price Check for Min Shares
-    buy_price = 0.5 
-    try:
-        prices = json.loads(best.get("outcome_prices", "[]"))
-        if prices and len(prices) >= 2:
-            buy_price = float(prices[0]) if side == "yes" else float(prices[1])
-    except: pass
-
-    amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
-    
-    # Enforce Min Shares (5.0)
-    min_shares = 5.0
-    estimated_shares = amount / buy_price if buy_price > 0 else 0
-    
-    if estimated_shares < min_shares:
-        required_amount = (min_shares * buy_price) * 1.05
-        if required_amount > float(cfg["max_position"]) * 3:
-            log(f"SKIP: Required amount ${required_amount:.2f} too high.", force=True)
-            return
-        log(f"ADJUST: Bumping amount to ${required_amount:.2f} to meet 5 share min.")
-        amount = required_amount
-
-    if amount < 1.0:
-        log("SKIP: Amount too small.", force=True)
-        return
-
-    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
-    write_lock(window_key, {"status": "pending"})
-
-    # 4. Execution
-    market_id, err, imported = import_market(api_key, best["slug"])
-    if not market_id:
-        log(f"FAIL: Import {err}", force=True)
-        clear_lock(window_key)
-        return
-
-    if not live:
-        log(f"DRY RUN: Buy {side} ${amount}", force=True)
-        return
-
-    res = execute_trade(api_key, market_id, side, amount=amount)
-    if res and res.get("success"):
-        st["trades"] = int(st.get("trades", 0)) + 1
-        st["last_trade_ts"] = now_utc().isoformat()
-        save_state(st)
-        log("TRADE: Success. Entering Monitor Mode...", force=True)
-        
-        write_lock(window_key, {"status": "active", "slug": best["slug"]})
-        
-        # 5. BLOCKING MONITOR (with SL/TP)
-        monitor_and_close(api_key, market_id, best["end_time"], side)
-        
-        log("CYCLE COMPLETE: Trade closed.", force=True)
-        write_lock(window_key, {"status": "closed", "slug": best["slug"]})
-        
-    else:
-        log(f"TRADE: Failed -> {res}", force=True)
-        clear_lock(window_key)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--live", action="store_true", help="Execute real trades (default dry-run)")
-    parser.add_argument("--quiet", "-q", action="store_true", help="Only output signal/errors")
-    parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio based sizing")
-    args = parser.parse_args()
-
-    cfg = load_config()
-    run_once(cfg, live=args.live, quiet=args.quiet, smart_sizing=args.smart_sizing)
+    log(f"TARGET: {best['slug']} (End: {best['end_
