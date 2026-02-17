@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v6.3 - Strict Monitor Fix).
+Railway-ready Simmer FastLoop bot (v6.4 - Fixed Missing Function).
 
 FIXES:
-- ✅ REMOVED AUTO-DETECT: Monitor now strictly tracks the side we just bought.
-  -> Prevents the bot from tracking "dust" from old losing trades.
-- ✅ DEBUG LOGS: Prints the exact payload before sending to API to prove intent.
-- ✅ IRON-CLAD CLOSE: Keeps the infinite retry loop to ensure exits.
+- ✅ RESTORED `import_market`: Fixed the "NameError" crash.
+- ✅ STRICT MONITOR: Only tracks the side you bought (No auto-detect confusion).
+- ✅ IRON-CLAD CLOSE: Infinite verification loop to ensure 0 shares remain.
 """
 
 import os, sys, json, argparse, time
@@ -63,10 +62,16 @@ def save_json(path: str, obj):
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
+def append_journal(event: dict):
+    event = dict(event)
+    event["ts"] = now_utc().isoformat()
+    with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/6.3")
+        req_headers.setdefault("User-Agent", "railway-fastloop/6.4")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -326,6 +331,34 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
 # -----------------------
 # Simmer actions
 # -----------------------
+def get_portfolio(api_key: str):
+    return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
+
+def find_simmer_market_broad(api_key: str, slug: str):
+    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
+    if isinstance(r, dict) and "markets" in r:
+        for m in r["markets"]:
+            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
+                return m.get("id")
+    return None
+
+def import_market(api_key: str, slug: str):
+    existing_id = find_simmer_market_broad(api_key, slug)
+    if existing_id: return existing_id, None, True
+
+    url = f"https://polymarket.com/event/{slug}"
+    for attempt in range(3):
+        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=90)
+        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
+            return r.get("market_id"), None, True
+        err = r.get("error") if isinstance(r, dict) else str(r)
+        if "internal server error" in str(err).lower():
+            time.sleep(2)
+            fallback_id = find_simmer_market_broad(api_key, slug)
+            if fallback_id: return fallback_id, None, True
+        time.sleep(2)
+    return None, "import_failed_after_retries", False
+
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     payload = {
         "market_id": market_id,
