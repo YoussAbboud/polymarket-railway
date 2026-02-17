@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.0 - Hardcoded & Fast).
+Railway-ready Simmer FastLoop bot (v7.1 - No More Silencing).
 
 FIXES:
-- ✅ REMOVED CONFIG LOADER: No more config.json or env vars for strategy.
-- ✅ HARDCODED SETTINGS: The variables at the top are the ONLY source of truth.
-- ✅ SIMPLE CLOSE: Monitors PnL -> Hammers SELL on target.
+- ✅ REMOVED ERROR HIDING: Removed 'try...except: pass' that silenced API errors.
+- ✅ BLIND FAIL-SAFE: If no price data is found for 45s, FORCE CLOSES.
+- ✅ HEARTBEAT: Prints a dot "." every loop so you know it's alive.
 """
 
 import os, sys, json, argparse, time
@@ -63,10 +63,10 @@ def save_json(path: str, obj):
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
-def api_request(url, method="GET", data=None, headers=None, timeout=25):
+def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/7.1")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -189,19 +189,39 @@ def monitor_and_close(api_key, market_id, end_time, side):
 
     print(f"MONITOR: Tracking {shares_owned:.4f} {side.upper()} @ {entry_price:.3f}. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
 
+    last_valid_price_time = time.time()
+    
     while now_utc() < target_time:
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        
+        # FAIL-SAFE: If no price for 45s, FORCE CLOSE
+        if time.time() - last_valid_price_time > 45:
+            print("\n!!! CRITICAL WARNING: No price data for 45s. FORCE CLOSING for safety !!!")
+            break
+
         res = api_request(f"https://gamma-api.polymarket.com/markets/{market_id}")
+        
         if isinstance(res, dict) and "outcomePrices" in res:
             try:
                 prices = json.loads(res["outcomePrices"])
                 curr_price = float(prices[0] if side == "yes" else prices[1])
-                pnl = (curr_price - entry_price) / entry_price
-                print(f"PnL: {pnl*100:+.1f}% | Price: {curr_price:.3f}")
+                last_valid_price_time = time.time() # Update timestamp
                 
-                if pnl <= -STOP_LOSS_PCT or pnl >= TAKE_PROFIT_PCT:
-                    print(f"THRESHOLD HIT: {pnl*100:.1f}%. Closing.")
+                pnl = (curr_price - entry_price) / entry_price
+                print(f"\nPnL: {pnl*100:+.1f}% | Price: {curr_price:.3f}")
+                
+                if pnl <= -STOP_LOSS_PCT:
+                    print(f"STOP LOSS HIT: {pnl*100:.1f}%. Closing.")
                     break
-            except: pass
+                if pnl >= TAKE_PROFIT_PCT:
+                    print(f"TAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
+                    break
+            except Exception as e:
+                print(f"\nDEBUG: Price parse error: {e}")
+        else:
+             print(f"\nDEBUG: Gamma API error or empty: {res.get('error', 'Unknown')}")
+             
         time.sleep(3)
         
     retry_close_until_success(api_key, market_id, side, shares_owned)
