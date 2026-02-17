@@ -23,9 +23,9 @@ MIN_MOMENTUM_PCT = 0.12
 MAX_POSITION_AMOUNT = 5.0    
 SMART_SIZING_PCT = 0.95      # Survival Mode
 
-STOP_LOSS_PCT = 0.25         # 25% Stop
-TAKE_PROFIT_PCT = 0.30       # 30% Profit
-CLOSE_BUFFER_SECONDS = 80    
+STOP_LOSS_PCT = 0.15         # 25% Stop
+TAKE_PROFIT_PCT = 0.20       # 30% Profit
+CLOSE_BUFFER_SECONDS = 120    
 # ==============================================================================
 
 # -----------------------
