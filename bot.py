@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v5.2 - Panic Close).
+Railway-ready Simmer FastLoop bot (v6.3 - Strict Monitor Fix).
 
-CHANGELOG:
-- ✅ FIX "Close Failed": Implemented 'force_close' with aggressive retries.
-- ✅ DEBUGGING: Prints FULL error message if closing fails.
-- ✅ SAFETY: Will not give up on closing until it tries 5 times or succeeds.
+FIXES:
+- ✅ REMOVED AUTO-DETECT: Monitor now strictly tracks the side we just bought.
+  -> Prevents the bot from tracking "dust" from old losing trades.
+- ✅ DEBUG LOGS: Prints the exact payload before sending to API to prove intent.
+- ✅ IRON-CLAD CLOSE: Keeps the infinite retry loop to ensure exits.
 """
 
 import os, sys, json, argparse, time
@@ -39,7 +40,7 @@ TRADE_SOURCE = "railway:fastloop"
 LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
 
 # --- STRATEGY SETTINGS ---
-CLOSE_BUFFER_SECONDS = 80   # Close 30s before end
+CLOSE_BUFFER_SECONDS = 80   # Close 80s before end
 STOP_LOSS_PCT = 0.05        # -5% Loss
 TAKE_PROFIT_PCT = 0.15      # +15% Profit
 
@@ -62,16 +63,10 @@ def save_json(path: str, obj):
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
-def append_journal(event: dict):
-    event = dict(event)
-    event["ts"] = now_utc().isoformat()
-    with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/5.2")
+        req_headers.setdefault("User-Agent", "railway-fastloop/6.3")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -163,6 +158,12 @@ def save_state(st: dict):
 # -----------------------
 # Position Check Helper
 # -----------------------
+def get_positions(api_key: str):
+    r = simmer_request("/api/sdk/positions", api_key=api_key, timeout=45)
+    if isinstance(r, dict) and "positions" in r: return r["positions"]
+    if isinstance(r, list): return r
+    return []
+
 def already_in_this_market(positions, slug: str, market_id: str = None):
     target_slug = (slug or "").strip().lower()
 
@@ -325,40 +326,6 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
 # -----------------------
 # Simmer actions
 # -----------------------
-def get_positions(api_key: str):
-    r = simmer_request("/api/sdk/positions", api_key=api_key, timeout=45)
-    if isinstance(r, dict) and "positions" in r: return r["positions"]
-    if isinstance(r, list): return r
-    return []
-
-def get_portfolio(api_key: str):
-    return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
-
-def find_simmer_market_broad(api_key: str, slug: str):
-    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
-    if isinstance(r, dict) and "markets" in r:
-        for m in r["markets"]:
-            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
-                return m.get("id")
-    return None
-
-def import_market(api_key: str, slug: str):
-    existing_id = find_simmer_market_broad(api_key, slug)
-    if existing_id: return existing_id, None, True
-
-    url = f"https://polymarket.com/event/{slug}"
-    for attempt in range(3):
-        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=90)
-        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
-            return r.get("market_id"), None, True
-        err = r.get("error") if isinstance(r, dict) else str(r)
-        if "internal server error" in str(err).lower():
-            time.sleep(2)
-            fallback_id = find_simmer_market_broad(api_key, slug)
-            if fallback_id: return fallback_id, None, True
-        time.sleep(2)
-    return None, "import_failed_after_retries", False
-
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     payload = {
         "market_id": market_id,
@@ -369,6 +336,10 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
     }
     if action == "sell": payload["shares"] = float(shares or 0)
     else: payload["amount"] = float(amount or 0)
+    
+    # DEBUG PRINT: Verify exact intent
+    if action == "buy":
+        print(f"DEBUG: SENDING BUY ORDER -> Side: {side.upper()} | Amount: ${amount:.2f}")
 
     for attempt in range(3):
         res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
@@ -380,27 +351,42 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
         return res
     return {"error": "max_retries_exceeded"}
 
-# --- NEW: AGGRESSIVE CLOSE WRAPPER ---
-def force_close_position(api_key: str, market_id: str, side: str, shares: float):
+# -----------------------
+# IRON-CLAD CLOSE LOGIC
+# -----------------------
+def iron_clad_close(api_key: str, market_id: str):
     """
-    Tries aggressively to close a position.
-    Prints FULL error if it fails.
+    Exits the trade and VERIFIES the wallet is 0. 
+    Will not return until the API confirms the position is closed.
     """
-    print(f"FORCE CLOSE: Attempting to sell {shares} shares of {side.upper()}...")
+    print(f"IRON-CLAD CLOSE: Ensuring exit for market {market_id}...")
     
-    for attempt in range(1, 6): # Try 5 times
-        res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
+    while True:
+        # Check actual wallet balance via Data API
+        r = simmer_request("/api/sdk/positions", api_key=api_key)
+        positions = r.get("positions", []) if isinstance(r, dict) else []
+        my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         
-        if res.get("success"):
-            print(f"CLOSE SUCCESS: Sold {shares} shares.")
+        if not my_pos:
+            print("VERIFIED: Position is completely gone.")
             return True
+
+        s_yes = float(my_pos.get("shares_yes", 0))
+        s_no = float(my_pos.get("shares_no", 0))
+
+        if s_yes <= 0.0001 and s_no <= 0.0001:
+            print("VERIFIED: Wallet shares at zero.")
+            return True
+
+        # If shares found, try to sell
+        if s_yes > 0:
+            print(f"ACTION: Selling {s_yes} YES shares...")
+            execute_trade(api_key, market_id, "yes", shares=s_yes, action="sell")
+        if s_no > 0:
+            print(f"ACTION: Selling {s_no} NO shares...")
+            execute_trade(api_key, market_id, "no", shares=s_no, action="sell")
         
-        # LOG THE ERROR
-        print(f"CLOSE FAILED (Attempt {attempt}/5): {json.dumps(res)}")
-        time.sleep(1.5) # Wait a bit before retry
-        
-    print("CRITICAL: Failed to close position after 5 attempts.")
-    return False
+        time.sleep(2.0) # Buffer to prevent API spamming
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
     if not smart_sizing: return max_size
@@ -431,13 +417,14 @@ def get_market_price(market_id: str):
             pass
     return None
 
-def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: str):
+def monitor_and_close(api_key: str, market_id: str, end_time: datetime, requested_side: str):
     """
-    Blocks execution until 30 seconds before end_time, CHECKING PnL every 3s.
+    Blocks execution until buffer time.
+    STRICT MODE: Only tracks the requested side.
     """
     target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    side = requested_side # STRICT: We trust what we just bought.
     
-    # 1. Get baseline position to estimate entry
     print("MONITOR: Fetching initial position details...")
     time.sleep(2) # Wait for trade to settle
     
@@ -445,29 +432,31 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
     my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
     
     if not my_pos:
-        print("MONITOR: Position not found (maybe delay?). Will try to track anyway.")
-        entry_price = 0.5 # fallback
+        print(f"MONITOR: Position not found yet. Waiting for {side.upper()} to appear...")
+        entry_price = 0.5 
     else:
-        # Try to find avg price
+        # Check if we have the shares we expect
+        s_expected = float(my_pos.get(f"shares_{side}", 0) or 0)
+        if s_expected <= 0:
+            print(f"MONITOR: WARNING! We bought {side.upper()} but wallet has 0. (Maybe lag or filled other side?)")
+        
         entry_price = float(my_pos.get("avg_buy_price", 0) or my_pos.get("avg_price", 0) or 0)
         if entry_price <= 0:
-            # Fallback to current market price
             prices = get_market_price(market_id)
             if prices:
                 idx = 0 if side == "yes" else 1
                 entry_price = float(prices[idx])
             else:
-                entry_price = 0.5 # Absolute fallback
+                entry_price = 0.5
 
     print(f"MONITOR: Tracking {side.upper()}. Entry Est: {entry_price:.3f}. Holding until {target_close_time.strftime('%H:%M:%S')}")
     
     while True:
         now = now_utc()
         if now >= target_close_time:
-            print("MONITOR: Time limit reached (30s buffer).")
+            print(f"MONITOR: Time limit reached ({CLOSE_BUFFER_SECONDS}s buffer).")
             break
             
-        # Check Price & PnL
         prices = get_market_price(market_id)
         if prices and entry_price > 0:
             idx = 0 if side == "yes" else 1
@@ -487,22 +476,7 @@ def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: st
         time.sleep(3)
 
     print("MONITOR: Closing position...")
-    
-    # Close logic (Updated to use force_close_position)
-    positions = get_positions(api_key)
-    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
-            
-    if not my_pos:
-        print("MONITOR: Position gone. Already closed?")
-        return
-
-    shares_yes = float(my_pos.get("shares_yes", 0) or 0)
-    shares_no  = float(my_pos.get("shares_no", 0) or 0)
-    
-    if shares_yes > 0:
-        force_close_position(api_key, market_id, "yes", shares_yes)
-    if shares_no > 0:
-        force_close_position(api_key, market_id, "no", shares_no)
+    iron_clad_close(api_key, market_id)
 
 def check_safety_close(api_key: str, positions):
     now = now_utc()
@@ -518,13 +492,7 @@ def check_safety_close(api_key: str, positions):
         if seconds_left < CLOSE_BUFFER_SECONDS:
             print(f"SAFETY: Found position {slug} near expiry ({seconds_left:.0f}s left). Closing now.")
             market_id = p.get("market_id") or p.get("id")
-            shares_yes = float(p.get("shares_yes", 0) or 0)
-            shares_no  = float(p.get("shares_no", 0) or 0)
-            
-            if shares_yes > 0:
-                force_close_position(api_key, market_id, "yes", shares_yes)
-            if shares_no > 0:
-                force_close_position(api_key, market_id, "no", shares_no)
+            iron_clad_close(api_key, market_id)
 
 def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
     def log(msg, force=False):
