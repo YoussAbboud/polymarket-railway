@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.4 - The Terminator Fix).
+Railway-ready Simmer FastLoop bot (v7.5 - Survival Mode).
 
 FIXES:
-- ✅ NO TRUST CLOSING: Ignores API "Success" messages.
-- ✅ WALLET VERIFICATION: Loops infinitely until `get_positions` returns 0 shares.
-- ✅ SPAM SELL: If shares remain, it sends another SELL order every 2 seconds.
+- ✅ SURVIVAL SIZING: If balance < $5, uses 90% of remaining funds automatically.
+- ✅ NO TRUST CLOSING: Ignores API "Success" messages; verifies wallet is empty.
+- ✅ TERMINATOR LOOP: Retries closing infinitely until shares are gone.
 """
 
 import os, sys, json, argparse, time
@@ -15,15 +15,15 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
 # ==============================================================================
-# 🚀 STRATEGY SETTINGS (CONTROL PANEL)
+# 🚀 STRATEGY SETTINGS
 # ==============================================================================
 ASSET = "BTC"                # BTC, ETH, or SOL
-LOOKBACK_MINS = 12           # Momentum timeframe (minutes)
-MIN_MOMENTUM_PCT = 0.12      # Entry trigger threshold
-MAX_POSITION_AMOUNT = 5.0    # Default trade size in USDC
-SMART_SIZING_PCT = 0.05      # % of portfolio to use if --smart-sizing is on
+LOOKBACK_MINS = 12           # Momentum timeframe
+MIN_MOMENTUM_PCT = 0.12      # Entry threshold (Quality > Quantity)
+MAX_POSITION_AMOUNT = 5.0    # Cap size (will auto-adjust down if wallet is low)
+SMART_SIZING_PCT = 0.90      # SURVIVAL MODE: Use 90% of balance for max recovery chance
 
-STOP_LOSS_PCT = 0.25         # Hard Stop Loss (25%)
+STOP_LOSS_PCT = 0.25         # Wide Stop Loss (25%) to avoid whipsaws
 TAKE_PROFIT_PCT = 0.30       # Take Profit (30%)
 CLOSE_BUFFER_SECONDS = 80    # Seconds before expiry to force close
 # ==============================================================================
@@ -66,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.4")
+        req_headers.setdefault("User-Agent", "railway-fastloop/7.5")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -189,7 +189,7 @@ def terminate_position_with_prejudice(api_key, market_id, side):
         execute_trade(api_key, market_id, side, shares=shares_left, action="sell")
         
         attempt += 1
-        time.sleep(2.0) # Wait 2s and check again
+        time.sleep(2.0) 
 
 def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
@@ -220,7 +220,6 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
             print("\n!!! CRITICAL: No price data for 45s. FORCE CLOSING !!!")
             break
 
-        # FETCH PRICE VIA SIMMER
         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
         
         if isinstance(res, dict) and "outcome_prices" in res:
@@ -246,7 +245,6 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
         time.sleep(3)
         
     print("") 
-    # CALL THE TERMINATOR
     terminate_position_with_prejudice(api_key, market_id, side)
 
 def run_once(live, quiet, smart_sizing):
@@ -269,7 +267,7 @@ def run_once(live, quiet, smart_sizing):
             if not quiet: print("SKIP: Already in market.")
             return
 
-    # 3. Signal (CoinGecko)
+    # 3. Signal
     coin_id = COINGECKO_IDS.get(ASSET, "bitcoin")
     data = api_request(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1")
     if "prices" not in data: 
@@ -279,11 +277,8 @@ def run_once(live, quiet, smart_sizing):
     prices = data["prices"]
     latest_ts, latest_price = prices[-1]
     target_ts = latest_ts - (LOOKBACK_MINS * 60 * 1000)
-    
     past_price = next((p for t, p in reversed(prices) if abs(t - target_ts) < 300000), None)
-    if not past_price: 
-        if not quiet: print("SKIP: No history found.")
-        return
+    if not past_price: return
 
     momentum = ((latest_price - past_price) / past_price) * 100
     if abs(momentum) < MIN_MOMENTUM_PCT:
@@ -293,16 +288,26 @@ def run_once(live, quiet, smart_sizing):
     side = "yes" if momentum > 0 else "no"
     print(f"SIGNAL: {side.upper()} | Mom={momentum:.3f}% | Price={latest_price:.2f}")
 
-    # 4. Sizing
+    # 4. SURVIVAL SIZING LOGIC
     amount = MAX_POSITION_AMOUNT
-    if smart_sizing:
-        pf = get_portfolio(api_key)
-        bal = float(pf.get("balance_usdc", 0) or 0)
+    pf = get_portfolio(api_key)
+    bal = float(pf.get("balance_usdc", 0) or 0)
+    
+    # If balance is low, use survival sizing (90% of everything)
+    if bal < MAX_POSITION_AMOUNT:
+        print(f"⚠️ LOW BALANCE ({bal:.2f}). Engaging Survival Sizing (90%)...")
+        amount = bal * 0.90
+    elif smart_sizing:
         amount = bal * SMART_SIZING_PCT
     
-    if (amount / 0.5) < 5.0: amount = 3.0 
+    # Force float precision
+    amount = float(f"{amount:.2f}")
+    
+    if amount < 0.5:
+        print("SKIP: Insufficient funds (Need >$0.50).")
+        return
 
-    # 4b. Get Est Entry Price for Monitor Fallback
+    # 4b. Get Est Entry Price
     est_entry_price = 0.5
     market_id, _, _ = import_market(api_key, slug)
     if market_id:
