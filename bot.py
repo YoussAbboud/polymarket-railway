@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.9 - X-Ray Mode).
+Railway-ready Simmer FastLoop bot (v8.0 - The Loud Mouth).
 
 FIXES:
-- ✅ X-RAY LOGGING: Prints RAW API response if price is missing (No more silent fails).
-- ✅ SMART PARSER: Checks 'outcome_prices', 'outcomePrices', and nested 'market' blocks.
-- ✅ ROBUSTNESS: Keeps the 'Terminator' close logic but fixes the blind panic trigger.
+- ✅ DEBUG PRINTING: If price check fails, it PRINTS the raw API response.
+- ✅ KEYS CHECK: Prints available JSON keys to debug API changes.
+- ✅ SURVIVAL MODE: Keeps 95% sizing logic.
 """
 
 import os, sys, json, argparse, time
@@ -19,12 +19,12 @@ from urllib.error import HTTPError, URLError
 # ==============================================================================
 ASSET = "BTC"                
 LOOKBACK_MINS = 12           
-MIN_MOMENTUM_PCT = 0.12      # High quality threshold
-MAX_POSITION_AMOUNT = 5.0    
+MIN_MOMENTUM_PCT = 0.12      
+MAX_POSITION_AMOUNT = 3.0    
 SMART_SIZING_PCT = 0.95      # Survival Mode
 
 STOP_LOSS_PCT = 0.25         # 25% Stop
-TAKE_PROFIT_PCT = 0.30       # 30% Profit
+TAKE_PROFIT_PCT = 0.20       # 30% Profit
 CLOSE_BUFFER_SECONDS = 80    
 # ==============================================================================
 
@@ -66,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.9")
+        req_headers.setdefault("User-Agent", "railway-fastloop/8.0")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -208,7 +208,7 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
         terminate_position_with_prejudice(api_key, market_id, side)
         return
 
-    # --- STEP 3: PnL MONITOR ---
+    # --- STEP 3: PnL MONITOR (DEBUG MODE) ---
     print(f"MONITOR: Live Tracking. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
     last_valid_price_time = time.time()
     
@@ -220,35 +220,24 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
             print("\n!!! CRITICAL: No price data for 45s. FORCE CLOSING !!!")
             break
 
-        # FETCH & PARSE PRICE (The "X-Ray" Logic)
         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
         
-        # DEBUG: Un-comment next line to see RAW spam if needed
-        # print(f"\nDEBUG RAW: {str(res)[:100]}") 
-
-        # Normalize the response (Unwrap 'market' or 'data' blocks)
+        # Normalize response
         data_block = res
         if isinstance(res, dict):
             if "market" in res: data_block = res["market"]
             elif "data" in res: data_block = res["data"]
             
         try:
-            # Try to find prices in various common keys
+            # TRY to find prices
             prices = None
             if "outcome_prices" in data_block: prices = data_block["outcome_prices"]
             elif "outcomePrices" in data_block: prices = data_block["outcomePrices"]
-            elif "clob_token_ids" in data_block: 
-                 # Fallback: Sometimes only clob IDs are sent, ignore for now to avoid complexity
-                 pass 
 
             if prices:
                 if isinstance(prices, str): prices = json.loads(prices)
                 
-                # Check 0/1 keys
-                p_yes = prices.get("0") or prices.get("yes")
-                p_no = prices.get("1") or prices.get("no")
-                
-                curr_price = float(p_yes if side == "yes" else p_no)
+                curr_price = float(prices["0" if side == "yes" else "1"])
                 last_valid_price_time = time.time()
                 
                 pnl = (curr_price - entry_price) / entry_price
@@ -261,12 +250,13 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
                     print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
                     break
             else:
-                # X-RAY: If we got a dict but no prices, tell user what keys we DID get
-                # sys.stdout.write(f"?") 
-                pass
+                # DEBUG: IF NO PRICES FOUND, PRINT WHY!
+                print(f"\nDEBUG: Price missing! Keys found: {list(data_block.keys())}")
+                print(f"DEBUG RAW: {str(res)[:200]}...")
 
         except Exception as e:
             print(f"\nDEBUG PARSE ERROR: {e}")
+            print(f"DEBUG RAW: {str(res)[:200]}...")
         
         time.sleep(3)
         
