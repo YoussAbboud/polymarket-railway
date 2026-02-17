@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v8.6 - The Steel Trap).
+Railway-ready Simmer FastLoop bot (v8.4 - Direct CLOB Connection).
 
 FIXES:
-- ✅ SETTLEMENT VERIFIER: Will not exit until wallet is verified 0 for 3 consecutive checks.
-- ✅ BLOCKCHAIN FINALITY: Adds 4-5s delays between sell attempts to prevent API spam.
-- ✅ PERSISTENT COOLDOWN: Enforces a 60s "rest" period between windows to prevent overlaps.
-- ✅ CLOB REAL-TIME: Retains direct Polymarket order book pricing for PnL.
+- ✅ DIRECT CLOB PRICING: Connects to Polymarket Order Book for real-time prices.
+- ✅ BYPASS SIMMER API: Ignores the laggy/stale dashboard data that caused 0% PnL.
+- ✅ AUTO-DETECT: Scans wallet for the *active* side (YES/UP) and tracks it.
 """
 
 import os, sys, json, argparse, time
@@ -21,13 +20,12 @@ from urllib.error import HTTPError, URLError
 ASSET = "BTC"                
 LOOKBACK_MINS = 12           
 MIN_MOMENTUM_PCT = 0.12      
-MAX_POSITION_AMOUNT = 5.0    
-SMART_SIZING_PCT = 0.95      
+MAX_POSITION_AMOUNT = 3.0    
+SMART_SIZING_PCT = 0.95      # Survival Mode
 
-STOP_LOSS_PCT = 0.15         
-TAKE_PROFIT_PCT = 0.20       
-CLOSE_BUFFER_SECONDS = 80    
-COOLDOWN_SECONDS = 60        
+STOP_LOSS_PCT = 0.15         # 25% Stop
+TAKE_PROFIT_PCT = 0.20       # 30% Profit
+CLOSE_BUFFER_SECONDS = 90    
 # ==============================================================================
 
 # -----------------------
@@ -35,15 +33,15 @@ COOLDOWN_SECONDS = 60
 # -----------------------
 DEFAULT_DATA_DIR = "/data" if os.path.isdir("/data") else ".data"
 DATA_DIR = os.environ.get("BOT_STATE_DIR", DEFAULT_DATA_DIR)
-STATE_PATH = os.path.join(DATA_DIR, "state.json")
-COOLDOWN_PATH = os.path.join(DATA_DIR, "last_close.json")
+STATE_PATH = os.environ.get("BOT_STATE_PATH", os.path.join(DATA_DIR, "state.json"))
+JOURNAL_PATH = os.environ.get("BOT_JOURNAL_PATH", os.path.join(DATA_DIR, "trades.jsonl"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------
 # API
 # -----------------------
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
-CLOB_BASE = "https://clob.polymarket.com"
+CLOB_BASE = "https://clob.polymarket.com"  # <--- THE KEY TO REAL-TIME DATA
 TRADE_SOURCE = "railway:fastloop"
 COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
@@ -68,9 +66,10 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/8.6")
+        req_headers.setdefault("User-Agent", "railway-fastloop/8.4")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
+        
         req = Request(url, data=body, headers=req_headers, method=method)
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -89,20 +88,33 @@ def get_api_key():
     return key
 
 # -----------------------
-# Cooldown & Finality
+# State & Locks
 # -----------------------
-def record_close_time():
-    save_json(COOLDOWN_PATH, {"timestamp": now_utc().timestamp()})
+def load_state():
+    st = load_json(STATE_PATH, {})
+    if st.get("day") != now_utc().date().isoformat():
+        st = {"day": now_utc().date().isoformat(), "trades": 0}
+    return st
 
-def check_and_wait_cooldown():
-    data = load_json(COOLDOWN_PATH, {})
-    last_ts = data.get("timestamp")
-    if last_ts:
-        elapsed = now_utc().timestamp() - last_ts
-        if elapsed < COOLDOWN_SECONDS:
-            wait_for = int(COOLDOWN_SECONDS - elapsed)
-            print(f"💤 COOLDOWN: Last trade was {int(elapsed)}s ago. Waiting {wait_for}s...")
-            time.sleep(wait_for)
+def save_state(st): save_json(STATE_PATH, st)
+
+def lock_path(key): return os.path.join(DATA_DIR, f"lock_{key.replace('/', '_')}.json")
+
+def write_lock(key, extra=None):
+    payload = {"ts": now_utc().isoformat(), "key": key}
+    if extra: payload.update(extra)
+    save_json(lock_path(key), payload)
+
+def clear_lock(key):
+    try: os.remove(lock_path(key))
+    except: pass
+
+def has_recent_lock(key):
+    data = load_json(lock_path(key), None)
+    if not data: return False
+    ts = datetime.fromisoformat(data["ts"])
+    if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+    return (now_utc() - ts).total_seconds() < 300
 
 # -----------------------
 # Core Functions
@@ -114,51 +126,77 @@ def get_positions(api_key):
     r = simmer_request("/api/sdk/positions", api_key=api_key)
     return r.get("positions", []) if isinstance(r, dict) else []
 
-def import_market(api_key, slug):
-    url = f"https://polymarket.com/event/{slug}"
-    r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=60)
-    if isinstance(r, dict) and r.get("market_id"):
-        return r.get("market_id")
+def find_simmer_market_broad(api_key, slug):
+    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
+    if isinstance(r, dict) and "markets" in r:
+        for m in r["markets"]:
+            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
+                return m.get("id")
     return None
+
+def import_market(api_key, slug):
+    existing_id = find_simmer_market_broad(api_key, slug)
+    if existing_id: return existing_id, None, True
+    
+    url = f"https://polymarket.com/event/{slug}"
+    for _ in range(3):
+        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=60)
+        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
+            return r.get("market_id"), None, True
+        time.sleep(2)
+    return None, "import_failed", False
 
 def execute_trade(api_key, market_id, side, amount=None, shares=None, action="buy"):
     payload = {"market_id": market_id, "side": side, "venue": "polymarket", "source": TRADE_SOURCE, "action": action}
     if action == "sell": payload["shares"] = float(shares or 0)
     else: payload["amount"] = float(amount or 0)
-    return simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=60)
+    
+    for _ in range(3):
+        res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=60)
+        if res and res.get("success"): return res
+        time.sleep(1)
+    return {"error": "max_retries"}
 
+# -----------------------
+# CLOB Pricing (The Fix)
+# -----------------------
 def get_clob_price(token_id):
+    """
+    Fetches real-time mid-price from Polymarket CLOB.
+    """
     if not token_id: return None
-    res = api_request(f"{CLOB_BASE}/prices/{token_id}", timeout=5)
-    return float(res["price"]) if isinstance(res, dict) and "price" in res else None
+    url = f"{CLOB_BASE}/prices/{token_id}"
+    res = api_request(url, timeout=5)
+    
+    if isinstance(res, dict) and "price" in res:
+        try:
+            return float(res["price"])
+        except: pass
+    return None
 
 # -----------------------
 # Logic
 # -----------------------
 def terminate_position_with_prejudice(api_key, market_id, side):
-    print(f"\n⚡ TERMINATOR: Initializing kill sequence for {side.upper()}...")
-    settled_count = 0
+    print(f"\n⚡ TERMINATOR ENGAGED: Checking wallet for {side.upper()} shares...")
     attempt = 1
-    
-    while settled_count < 3:
+    while True:
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
-        shares_left = float(my_pos.get(f"shares_{side}", 0)) if my_pos else 0
         
+        if not my_pos:
+            print("✅ TERMINATOR: Position is completely gone.")
+            return True
+            
+        shares_left = float(my_pos.get(f"shares_{side}", 0))
         if shares_left <= 0.001:
-            settled_count += 1
-            print(f"✅ VERIFYING: {settled_count}/3 (Wallet shows 0 shares)")
-            time.sleep(4)
-        else:
-            settled_count = 0
-            print(f"⚠️  RESIDUAL DETECTED: {shares_left} shares. Sending SELL (Attempt {attempt})...")
-            execute_trade(api_key, market_id, side, shares=shares_left, action="sell")
-            attempt += 1
-            time.sleep(5) # Wait for Polygon block time
+             print("✅ TERMINATOR: Shares at 0.")
+             return True
 
-    print("🏁 FINALITY REACHED: Trade successfully purged from wallet.")
-    record_close_time()
-    return True
+        print(f"⚠️  SHARES DETECTED: {shares_left} remaining. Sending SELL (Attempt {attempt})...")
+        execute_trade(api_key, market_id, side, shares=shares_left, action="sell")
+        attempt += 1
+        time.sleep(2.0) 
 
 def monitor_and_close(api_key, market_id, end_time, initial_side):
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
@@ -169,31 +207,56 @@ def monitor_and_close(api_key, market_id, end_time, initial_side):
     entry_price = 0.5
     token_id_map = {}
 
+    # --- STEP 1: AUTO-DETECT SIDE & EXISTENCE ---
+    # We loop to find what we REALLY own (ignoring what we "thought" we bought)
     for i in range(20): 
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+        
         if my_pos:
-            s_yes, s_no = float(my_pos.get("shares_yes", 0)), float(my_pos.get("shares_no", 0))
-            if s_yes > 0.001: 
-                active_side, shares_owned = "yes", s_yes
-            elif s_no > 0.001: 
-                active_side, shares_owned = "no", s_no
+            s_yes = float(my_pos.get("shares_yes", 0))
+            s_no = float(my_pos.get("shares_no", 0))
+            
+            # Determine which side we actually hold
+            if s_yes > 0.001:
+                active_side = "yes"
+                shares_owned = s_yes
+                entry_price = float(my_pos.get("avg_buy_price", 0)) or 0.5
+            elif s_no > 0.001:
+                active_side = "no"
+                shares_owned = s_no
+                entry_price = float(my_pos.get("avg_buy_price", 0)) or 0.5
             
             if shares_owned > 0:
-                entry_price = float(my_pos.get("avg_buy_price", 0)) or 0.5
-                print(f"MONITOR: Auto-Detected {active_side.upper()} | {shares_owned:.4f} shares @ {entry_price:.3f}")
+                print(f"MONITOR: Auto-Detected {active_side.upper()} position: {shares_owned:.4f} shares @ {entry_price:.3f}")
+                
+                # Fetch Token IDs for CLOB
                 if "clob_token_ids" in my_pos:
                     ids = my_pos["clob_token_ids"]
                     if isinstance(ids, str): ids = json.loads(ids)
-                    token_id_map["yes"], token_id_map["no"] = ids.get("0"), ids.get("1")
+                    token_id_map["yes"] = ids.get("0")
+                    token_id_map["no"] = ids.get("1")
                 break
+        
+        print(f"MONITOR: Waiting for shares... ({i+1}/20)")
         time.sleep(3)
 
+    # --- STEP 2: GHOST BUSTER (EXIT IF EMPTY) ---
     if shares_owned <= 0.001:
-        print("✅ MONITOR: No shares found. Already closed.")
-        record_close_time()
+        print(f"✅ MONITOR: No shares found in wallet. Trade is ALREADY CLOSED.")
         return
 
+    # Fallback for Token IDs
+    if not token_id_map:
+        res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
+        data = res.get("market") or res.get("data") or {}
+        if "clob_token_ids" in data:
+            ids = data["clob_token_ids"]
+            if isinstance(ids, str): ids = json.loads(ids)
+            token_id_map["yes"] = ids.get("0")
+            token_id_map["no"] = ids.get("1")
+
+    # --- STEP 3: REAL-TIME CLOB MONITOR ---
     print(f"MONITOR: Tracking via CLOB. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
     active_token_id = token_id_map.get("0" if active_side == "yes" else "1")
     
@@ -201,67 +264,114 @@ def monitor_and_close(api_key, market_id, end_time, initial_side):
         sys.stdout.write(".")
         sys.stdout.flush()
         
-        # Ghost Buster Check
+        # Check if position is gone (Ghost Buster Loop)
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
-        if not my_pos or float(my_pos.get(f"shares_{active_side}", 0)) <= 0.001:
-             print("\n✅ MONITOR: Wallet is empty. Exiting.")
-             record_close_time()
+        curr_shares = float(my_pos.get(f"shares_{active_side}", 0)) if my_pos else 0
+        if curr_shares <= 0.001:
+             print("\n✅ MONITOR: Shares dropped to 0. Trade Closed.")
              return
 
+        # USE CLOB PRICE
         curr_price = get_clob_price(active_token_id)
-        if curr_price:
+        
+        if curr_price is not None:
             pnl = (curr_price - entry_price) / entry_price
             print(f"\rMONITOR: {active_side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}%   ", end="")
-            if pnl <= -STOP_LOSS_PCT or pnl >= TAKE_PROFIT_PCT:
+            
+            if pnl <= -STOP_LOSS_PCT:
+                print(f"\nSTOP LOSS HIT: {pnl*100:.1f}%. Closing.")
                 break
+            if pnl >= TAKE_PROFIT_PCT:
+                print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
+                break
+        else:
+             # If CLOB fails, wait a bit
+             pass
+
         time.sleep(2)
         
+    print("") 
     terminate_position_with_prejudice(api_key, market_id, active_side)
 
 def run_once(live, quiet, smart_sizing):
-    check_and_wait_cooldown()
     api_key = get_api_key()
     
+    # 1. Discovery
     now = now_utc()
-    start_dt = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
-    slug = f"{ASSET.lower()}-updown-5m-{int(start_dt.timestamp())}"
+    minute = (now.minute // 5) * 5
+    start_dt = now.replace(minute=minute, second=0, microsecond=0)
+    ts = int(start_dt.timestamp())
+    slug = f"{ASSET.lower()}-updown-5m-{ts}"
     end_time = start_dt + timedelta(minutes=5)
 
-    if not quiet: print(f"TARGET: {slug}")
+    if not quiet: print(f"TARGET: {slug} (Ends {end_time.strftime('%H:%M')})")
     
+    # 2. Existing Check
     positions = get_positions(api_key)
-    if any(slug in str(p.get("slug", "")) for p in positions): return
+    for p in positions:
+        if slug in str(p.get("slug", "")) or slug in str(p.get("polymarket_url", "")):
+            if not quiet: print("SKIP: Already in market.")
+            return
 
+    # 3. Signal
     coin_id = COINGECKO_IDS.get(ASSET, "bitcoin")
     data = api_request(f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1")
-    if "prices" not in data: return
+    if "prices" not in data: 
+        if not quiet: print("SKIP: Signal error.")
+        return
+        
     prices = data["prices"]
-    latest_price = prices[-1][1]
-    target_ts = prices[-1][0] - (LOOKBACK_MINS * 60 * 1000)
+    latest_ts, latest_price = prices[-1]
+    target_ts = latest_ts - (LOOKBACK_MINS * 60 * 1000)
     past_price = next((p for t, p in reversed(prices) if abs(t - target_ts) < 300000), None)
-    if not past_price: return
+    if not past_price: 
+        if not quiet: print("SKIP: No history found.")
+        return
 
     momentum = ((latest_price - past_price) / past_price) * 100
-    if abs(momentum) < MIN_MOMENTUM_PCT: return
+    if abs(momentum) < MIN_MOMENTUM_PCT:
+        if not quiet: print(f"SKIP: Weak momentum {momentum:.3f}% (Threshold: {MIN_MOMENTUM_PCT}%)")
+        return
         
     side = "yes" if momentum > 0 else "no"
-    print(f"SIGNAL: {side.upper()} | Mom={momentum:.3f}%")
+    print(f"SIGNAL: {side.upper()} | Mom={momentum:.3f}% | Price={latest_price:.2f}")
 
+    # 4. SURVIVAL SIZING
+    amount = MAX_POSITION_AMOUNT
     pf = get_portfolio(api_key)
     bal = float(pf.get("balance_usdc", 0) or 0)
-    amount = bal * 0.95 if bal < 5.0 else (bal * SMART_SIZING_PCT if smart_sizing else MAX_POSITION_AMOUNT)
+    
+    if bal < MAX_POSITION_AMOUNT:
+        print(f"⚠️ LOW BALANCE ({bal:.2f}). Engaging Survival Sizing (95%)...")
+        amount = bal * 0.95
+    elif smart_sizing:
+        amount = bal * SMART_SIZING_PCT
+    
     amount = float(f"{amount:.2f}")
+    
+    if amount < 0.2: 
+        print(f"SKIP: Insufficient funds ({amount:.2f}). Need >$0.20.")
+        return
 
-    if amount < 0.2 or not live: return
+    # 5. Execute
+    market_id, _, _ = import_market(api_key, slug)
+    if not market_id:
+        print("FAIL: Import error.")
+        return
 
-    market_id = import_market(api_key, slug)
-    if not market_id: return
+    if not live:
+        print(f"DRY RUN: Buy {side} ${amount}")
+        return
 
     res = execute_trade(api_key, market_id, side, amount=amount)
     if res.get("success"):
+        st = load_state()
+        st["trades"] += 1
+        save_state(st)
         print("TRADE: Success. Monitoring...")
         monitor_and_close(api_key, market_id, end_time, side)
+        print("CYCLE COMPLETE: Closed.")
     else:
         print(f"TRADE FAILED: {res.get('error')}")
 
