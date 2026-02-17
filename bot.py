@@ -3,7 +3,7 @@
 Railway-ready Simmer FastLoop bot (v7.6 - Never Abandon).
 
 CRITICAL FIXES:
-- ✅ REMOVED "QUIT" LOGIC: Bot will NEVER exit just because API reports 0 shares.
+- ✅ REMOVED "QUIT" LOGIC: Bot will NEVER exit just because API reports 0 shares .
 - ✅ ENTRY RETRY LOOP: Waits up to 60s for shares to appear (beating API lag).
 - ✅ BLIND TERMINATOR: If shares never show up, it starts blind-selling anyway.
 - ✅ SURVIVAL MODE: Auto-detects <$5 balance and goes all-in to recover.
