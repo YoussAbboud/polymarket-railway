@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v8.1 - JSON Parsing Fix).
+Railway-ready Simmer FastLoop bot (v8.4 - Direct CLOB Connection).
 
 FIXES:
-- ✅ JSON PARSING: Now reads 'current_probability' instead of missing 'outcome_prices'.
-- ✅ PRICE LOGIC: Calculates NO price as (1.0 - current_probability).
-- ✅ STABILITY: Removes the "X-Ray" debug clutter now that we know the fix.
+- ✅ DIRECT CLOB PRICING: Connects to Polymarket Order Book for real-time prices.
+- ✅ BYPASS SIMMER API: Ignores the laggy/stale dashboard data that caused 0% PnL.
+- ✅ AUTO-DETECT: Scans wallet for the *active* side (YES/UP) and tracks it.
 """
 
 import os, sys, json, argparse, time
@@ -29,19 +29,19 @@ CLOSE_BUFFER_SECONDS = 80
 # ==============================================================================
 
 # -----------------------
-# Persistence locations
+# Persistence
 # -----------------------
 DEFAULT_DATA_DIR = "/data" if os.path.isdir("/data") else ".data"
 DATA_DIR = os.environ.get("BOT_STATE_DIR", DEFAULT_DATA_DIR)
 STATE_PATH = os.environ.get("BOT_STATE_PATH", os.path.join(DATA_DIR, "state.json"))
 JOURNAL_PATH = os.environ.get("BOT_JOURNAL_PATH", os.path.join(DATA_DIR, "trades.jsonl"))
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------
 # API
 # -----------------------
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
+CLOB_BASE = "https://clob.polymarket.com"  # <--- THE KEY TO REAL-TIME DATA
 TRADE_SOURCE = "railway:fastloop"
 COINGECKO_IDS = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana"}
 
@@ -66,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/8.1")
+        req_headers.setdefault("User-Agent", "railway-fastloop/8.4")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -158,6 +158,23 @@ def execute_trade(api_key, market_id, side, amount=None, shares=None, action="bu
     return {"error": "max_retries"}
 
 # -----------------------
+# CLOB Pricing (The Fix)
+# -----------------------
+def get_clob_price(token_id):
+    """
+    Fetches real-time mid-price from Polymarket CLOB.
+    """
+    if not token_id: return None
+    url = f"{CLOB_BASE}/prices/{token_id}"
+    res = api_request(url, timeout=5)
+    
+    if isinstance(res, dict) and "price" in res:
+        try:
+            return float(res["price"])
+        except: pass
+    return None
+
+# -----------------------
 # Logic
 # -----------------------
 def terminate_position_with_prejudice(api_key, market_id, side):
@@ -181,97 +198,101 @@ def terminate_position_with_prejudice(api_key, market_id, side):
         attempt += 1
         time.sleep(2.0) 
 
-def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
+def monitor_and_close(api_key, market_id, end_time, initial_side):
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     print("MONITOR: Waiting for trade to settle...")
     
+    active_side = initial_side
     shares_owned = 0.0
-    entry_price = est_entry_price
-    
-    # --- STEP 1: WAIT FOR SHARES ---
+    entry_price = 0.5
+    token_id_map = {}
+
+    # --- STEP 1: AUTO-DETECT SIDE & EXISTENCE ---
+    # We loop to find what we REALLY own (ignoring what we "thought" we bought)
     for i in range(20): 
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         
         if my_pos:
-            shares_owned = float(my_pos.get(f"shares_{side}", 0))
+            s_yes = float(my_pos.get("shares_yes", 0))
+            s_no = float(my_pos.get("shares_no", 0))
+            
+            # Determine which side we actually hold
+            if s_yes > 0.001:
+                active_side = "yes"
+                shares_owned = s_yes
+                entry_price = float(my_pos.get("avg_buy_price", 0)) or 0.5
+            elif s_no > 0.001:
+                active_side = "no"
+                shares_owned = s_no
+                entry_price = float(my_pos.get("avg_buy_price", 0)) or 0.5
+            
             if shares_owned > 0:
-                entry_price = float(my_pos.get("avg_buy_price", 0)) or est_entry_price
-                print(f"MONITOR: Shares confirmed! Tracking {shares_owned:.4f} {side.upper()} @ {entry_price:.3f}")
+                print(f"MONITOR: Auto-Detected {active_side.upper()} position: {shares_owned:.4f} shares @ {entry_price:.3f}")
+                
+                # Fetch Token IDs for CLOB
+                if "clob_token_ids" in my_pos:
+                    ids = my_pos["clob_token_ids"]
+                    if isinstance(ids, str): ids = json.loads(ids)
+                    token_id_map["yes"] = ids.get("0")
+                    token_id_map["no"] = ids.get("1")
                 break
         
-        print(f"MONITOR: Waiting for shares to appear in wallet... ({i+1}/20)")
+        print(f"MONITOR: Waiting for shares... ({i+1}/20)")
         time.sleep(3)
 
-    if shares_owned <= 0:
-        print(f"WARNING: API never showed shares. Engaging Terminator blindly.")
-        terminate_position_with_prejudice(api_key, market_id, side)
+    # --- STEP 2: GHOST BUSTER (EXIT IF EMPTY) ---
+    if shares_owned <= 0.001:
+        print(f"✅ MONITOR: No shares found in wallet. Trade is ALREADY CLOSED.")
         return
 
-    # --- STEP 3: PnL MONITOR ---
-    print(f"MONITOR: Live Tracking. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
-    last_valid_price_time = time.time()
+    # Fallback for Token IDs
+    if not token_id_map:
+        res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
+        data = res.get("market") or res.get("data") or {}
+        if "clob_token_ids" in data:
+            ids = data["clob_token_ids"]
+            if isinstance(ids, str): ids = json.loads(ids)
+            token_id_map["yes"] = ids.get("0")
+            token_id_map["no"] = ids.get("1")
+
+    # --- STEP 3: REAL-TIME CLOB MONITOR ---
+    print(f"MONITOR: Tracking via CLOB. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
+    active_token_id = token_id_map.get("0" if active_side == "yes" else "1")
     
     while now_utc() < target_time:
         sys.stdout.write(".")
         sys.stdout.flush()
         
-        if time.time() - last_valid_price_time > 45:
-            print("\n!!! CRITICAL: No price data for 45s. FORCE CLOSING !!!")
-            break
+        # Check if position is gone (Ghost Buster Loop)
+        positions = get_positions(api_key)
+        my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+        curr_shares = float(my_pos.get(f"shares_{active_side}", 0)) if my_pos else 0
+        if curr_shares <= 0.001:
+             print("\n✅ MONITOR: Shares dropped to 0. Trade Closed.")
+             return
 
-        res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
+        # USE CLOB PRICE
+        curr_price = get_clob_price(active_token_id)
         
-        # Normalize
-        data_block = res
-        if isinstance(res, dict):
-            if "market" in res: data_block = res["market"]
-            elif "data" in res: data_block = res["data"]
+        if curr_price is not None:
+            pnl = (curr_price - entry_price) / entry_price
+            print(f"\rMONITOR: {active_side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}%   ", end="")
             
-        try:
-            # --- PARSING FIX IS HERE ---
-            # We look for 'current_probability' as the source of truth for YES price
-            raw_prob = None
-            
-            if "current_probability" in data_block:
-                raw_prob = float(data_block["current_probability"])
-            elif "current_price" in data_block:
-                raw_prob = float(data_block["current_price"])
-            elif "outcome_prices" in data_block:
-                 # Legacy fallback
-                 prices = data_block["outcome_prices"]
-                 if isinstance(prices, str): prices = json.loads(prices)
-                 raw_prob = float(prices["0" if side == "yes" else "1"])
+            if pnl <= -STOP_LOSS_PCT:
+                print(f"\nSTOP LOSS HIT: {pnl*100:.1f}%. Closing.")
+                break
+            if pnl >= TAKE_PROFIT_PCT:
+                print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
+                break
+        else:
+             # If CLOB fails, wait a bit
+             pass
 
-            if raw_prob is not None:
-                # Calculate Price based on Side
-                if side == "yes":
-                    curr_price = raw_prob
-                else:
-                    curr_price = 1.0 - raw_prob
-                
-                last_valid_price_time = time.time()
-                
-                pnl = (curr_price - entry_price) / entry_price
-                print(f"\rMONITOR: {side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}%   ", end="")
-                
-                if pnl <= -STOP_LOSS_PCT:
-                    print(f"\nSTOP LOSS HIT: {pnl*100:.1f}%. Closing.")
-                    break
-                if pnl >= TAKE_PROFIT_PCT:
-                    print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
-                    break
-            else:
-                 pass # Still no price found (keep dotting)
-
-        except Exception as e:
-            # Fail silently to avoid spam now that we know the issue
-            pass
-        
-        time.sleep(3)
+        time.sleep(2)
         
     print("") 
-    terminate_position_with_prejudice(api_key, market_id, side)
+    terminate_position_with_prejudice(api_key, market_id, active_side)
 
 def run_once(live, quiet, smart_sizing):
     api_key = get_api_key()
@@ -333,19 +354,8 @@ def run_once(live, quiet, smart_sizing):
         print(f"SKIP: Insufficient funds ({amount:.2f}). Need >$0.20.")
         return
 
-    # 4b. Est Entry
-    est_entry_price = 0.5
-    market_id, _, _ = import_market(api_key, slug)
-    if market_id:
-         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
-         # Try to get est price from probability
-         if isinstance(res, dict):
-             if "market" in res: res = res["market"]
-             if "current_probability" in res:
-                 p = float(res["current_probability"])
-                 est_entry_price = p if side == "yes" else (1.0 - p)
-
     # 5. Execute
+    market_id, _, _ = import_market(api_key, slug)
     if not market_id:
         print("FAIL: Import error.")
         return
@@ -360,7 +370,7 @@ def run_once(live, quiet, smart_sizing):
         st["trades"] += 1
         save_state(st)
         print("TRADE: Success. Monitoring...")
-        monitor_and_close(api_key, market_id, end_time, side, est_entry_price)
+        monitor_and_close(api_key, market_id, end_time, side)
         print("CYCLE COMPLETE: Closed.")
     else:
         print(f"TRADE FAILED: {res.get('error')}")
