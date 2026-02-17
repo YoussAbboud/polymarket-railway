@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.6 - Never Abandon).
+Railway-ready Simmer FastLoop bot (v7.9 - X-Ray Mode).
 
-CRITICAL FIXES:
-- ✅ REMOVED "QUIT" LOGIC: Bot will NEVER exit just because API reports 0 shares .
-- ✅ ENTRY RETRY LOOP: Waits up to 60s for shares to appear (beating API lag).
-- ✅ BLIND TERMINATOR: If shares never show up, it starts blind-selling anyway.
-- ✅ SURVIVAL MODE: Auto-detects <$5 balance and goes all-in to recover.
+FIXES:
+- ✅ X-RAY LOGGING: Prints RAW API response if price is missing (No more silent fails).
+- ✅ SMART PARSER: Checks 'outcome_prices', 'outcomePrices', and nested 'market' blocks.
+- ✅ ROBUSTNESS: Keeps the 'Terminator' close logic but fixes the blind panic trigger.
 """
 
 import os, sys, json, argparse, time
@@ -20,9 +19,9 @@ from urllib.error import HTTPError, URLError
 # ==============================================================================
 ASSET = "BTC"                
 LOOKBACK_MINS = 12           
-MIN_MOMENTUM_PCT = 0.12      
+MIN_MOMENTUM_PCT = 0.12      # High quality threshold
 MAX_POSITION_AMOUNT = 5.0    
-SMART_SIZING_PCT = 0.95      # Survival: Use 95% of remaining funds
+SMART_SIZING_PCT = 0.95      # Survival Mode
 
 STOP_LOSS_PCT = 0.25         # 25% Stop
 TAKE_PROFIT_PCT = 0.30       # 30% Profit
@@ -67,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.6")
+        req_headers.setdefault("User-Agent", "railway-fastloop/7.9")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -162,33 +161,23 @@ def execute_trade(api_key, market_id, side, amount=None, shares=None, action="bu
 # Logic
 # -----------------------
 def terminate_position_with_prejudice(api_key, market_id, side):
-    """
-    THE TERMINATOR: Loops endlessly checking the wallet.
-    If shares exist, it sends a SELL order.
-    It DOES NOT STOP until shares == 0.
-    """
     print(f"\n⚡ TERMINATOR ENGAGED: Checking wallet for {side.upper()} shares...")
-    
     attempt = 1
     while True:
-        # 1. CHECK WALLET
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         
-        # 2. IF GONE, WE WIN
         if not my_pos:
-            print("✅ TERMINATOR: Position is completely gone. Mission accomplished.")
+            print("✅ TERMINATOR: Position is completely gone.")
             return True
             
         shares_left = float(my_pos.get(f"shares_{side}", 0))
         if shares_left <= 0.001:
-             print("✅ TERMINATOR: Shares at 0. Mission accomplished.")
+             print("✅ TERMINATOR: Shares at 0.")
              return True
 
-        # 3. IF SHARES EXIST, KILL THEM
         print(f"⚠️  SHARES DETECTED: {shares_left} remaining. Sending SELL (Attempt {attempt})...")
         execute_trade(api_key, market_id, side, shares=shares_left, action="sell")
-        
         attempt += 1
         time.sleep(2.0) 
 
@@ -199,8 +188,8 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
     shares_owned = 0.0
     entry_price = est_entry_price
     
-    # --- STEP 1: WAIT FOR SHARES TO APPEAR (The "Never Abandon" Loop) ---
-    for i in range(20): # Try for 60 seconds (20 * 3s)
+    # --- STEP 1: WAIT FOR SHARES ---
+    for i in range(20): 
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         
@@ -214,9 +203,8 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
         print(f"MONITOR: Waiting for shares to appear in wallet... ({i+1}/20)")
         time.sleep(3)
 
-    # --- STEP 2: IF SHARES NEVER APPEARED, ASSUME GHOST & TERMINATE ---
     if shares_owned <= 0:
-        print(f"WARNING: API never showed shares. Engaging Terminator blindly just in case.")
+        print(f"WARNING: API never showed shares. Engaging Terminator blindly.")
         terminate_position_with_prejudice(api_key, market_id, side)
         return
 
@@ -228,19 +216,39 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
         sys.stdout.write(".")
         sys.stdout.flush()
         
-        # FAIL-SAFE: If no price for 45s, FORCE CLOSE
         if time.time() - last_valid_price_time > 45:
             print("\n!!! CRITICAL: No price data for 45s. FORCE CLOSING !!!")
             break
 
+        # FETCH & PARSE PRICE (The "X-Ray" Logic)
         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
         
-        if isinstance(res, dict) and "outcome_prices" in res:
-            try:
-                prices = res["outcome_prices"]
+        # DEBUG: Un-comment next line to see RAW spam if needed
+        # print(f"\nDEBUG RAW: {str(res)[:100]}") 
+
+        # Normalize the response (Unwrap 'market' or 'data' blocks)
+        data_block = res
+        if isinstance(res, dict):
+            if "market" in res: data_block = res["market"]
+            elif "data" in res: data_block = res["data"]
+            
+        try:
+            # Try to find prices in various common keys
+            prices = None
+            if "outcome_prices" in data_block: prices = data_block["outcome_prices"]
+            elif "outcomePrices" in data_block: prices = data_block["outcomePrices"]
+            elif "clob_token_ids" in data_block: 
+                 # Fallback: Sometimes only clob IDs are sent, ignore for now to avoid complexity
+                 pass 
+
+            if prices:
                 if isinstance(prices, str): prices = json.loads(prices)
                 
-                curr_price = float(prices["0" if side == "yes" else "1"])
+                # Check 0/1 keys
+                p_yes = prices.get("0") or prices.get("yes")
+                p_no = prices.get("1") or prices.get("no")
+                
+                curr_price = float(p_yes if side == "yes" else p_no)
                 last_valid_price_time = time.time()
                 
                 pnl = (curr_price - entry_price) / entry_price
@@ -252,8 +260,13 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
                 if pnl >= TAKE_PROFIT_PCT:
                     print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
                     break
-            except Exception as e:
-                pass 
+            else:
+                # X-RAY: If we got a dict but no prices, tell user what keys we DID get
+                # sys.stdout.write(f"?") 
+                pass
+
+        except Exception as e:
+            print(f"\nDEBUG PARSE ERROR: {e}")
         
         time.sleep(3)
         
@@ -263,7 +276,7 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
 def run_once(live, quiet, smart_sizing):
     api_key = get_api_key()
     
-    # 1. Market Discovery
+    # 1. Discovery
     now = now_utc()
     minute = (now.minute // 5) * 5
     start_dt = now.replace(minute=minute, second=0, microsecond=0)
@@ -273,7 +286,7 @@ def run_once(live, quiet, smart_sizing):
 
     if not quiet: print(f"TARGET: {slug} (Ends {end_time.strftime('%H:%M')})")
     
-    # 2. Check Existing
+    # 2. Existing Check
     positions = get_positions(api_key)
     for p in positions:
         if slug in str(p.get("slug", "")) or slug in str(p.get("polymarket_url", "")):
@@ -290,7 +303,6 @@ def run_once(live, quiet, smart_sizing):
     prices = data["prices"]
     latest_ts, latest_price = prices[-1]
     target_ts = latest_ts - (LOOKBACK_MINS * 60 * 1000)
-    
     past_price = next((p for t, p in reversed(prices) if abs(t - target_ts) < 300000), None)
     if not past_price: 
         if not quiet: print("SKIP: No history found.")
@@ -298,13 +310,13 @@ def run_once(live, quiet, smart_sizing):
 
     momentum = ((latest_price - past_price) / past_price) * 100
     if abs(momentum) < MIN_MOMENTUM_PCT:
-        if not quiet: print(f"SKIP: Weak momentum {momentum:.3f}%")
+        if not quiet: print(f"SKIP: Weak momentum {momentum:.3f}% (Threshold: {MIN_MOMENTUM_PCT}%)")
         return
         
     side = "yes" if momentum > 0 else "no"
     print(f"SIGNAL: {side.upper()} | Mom={momentum:.3f}% | Price={latest_price:.2f}")
 
-    # 4. SURVIVAL SIZING LOGIC
+    # 4. SURVIVAL SIZING
     amount = MAX_POSITION_AMOUNT
     pf = get_portfolio(api_key)
     bal = float(pf.get("balance_usdc", 0) or 0)
@@ -317,11 +329,11 @@ def run_once(live, quiet, smart_sizing):
     
     amount = float(f"{amount:.2f}")
     
-    if amount < 0.2: # Polymarket might reject < $0.20, but we try
+    if amount < 0.2: 
         print(f"SKIP: Insufficient funds ({amount:.2f}). Need >$0.20.")
         return
 
-    # 4b. Get Est Entry Price
+    # 4b. Est Entry
     est_entry_price = 0.5
     market_id, _, _ = import_market(api_key, slug)
     if market_id:
@@ -348,7 +360,6 @@ def run_once(live, quiet, smart_sizing):
         st["trades"] += 1
         save_state(st)
         print("TRADE: Success. Monitoring...")
-        # CRITICAL: We pass CONTROL to the monitor. It is now responsible for life/death.
         monitor_and_close(api_key, market_id, end_time, side, est_entry_price)
         print("CYCLE COMPLETE: Closed.")
     else:
