@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v6.4 - Fixed Missing Function).
+Railway-ready Simmer FastLoop bot (v6.5 - Three-Strike Verification).
 
 FIXES:
-- ✅ RESTORED `import_market`: Fixed the "NameError" crash.
-- ✅ STRICT MONITOR: Only tracks the side you bought (No auto-detect confusion).
-- ✅ IRON-CLAD CLOSE: Infinite verification loop to ensure 0 shares remain.
+- ✅ THREE-STRIKE RULE: Requires 3 consecutive "0 share" checks to confirm close.
+  -> Prevents the "API Lag" where shares momentarily disappear and reappear.
+- ✅ STRICT MONITOR: Only tracks the side you bought.
+- ✅ DEBUG LOGS: Prints detailed selling actions.
 """
 
 import os, sys, json, argparse, time
@@ -71,7 +72,7 @@ def append_journal(event: dict):
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/6.4")
+        req_headers.setdefault("User-Agent", "railway-fastloop/6.5")
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
@@ -331,34 +332,6 @@ def get_coingecko_momentum(asset: str, lookback_minutes: int):
 # -----------------------
 # Simmer actions
 # -----------------------
-def get_portfolio(api_key: str):
-    return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
-
-def find_simmer_market_broad(api_key: str, slug: str):
-    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
-    if isinstance(r, dict) and "markets" in r:
-        for m in r["markets"]:
-            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
-                return m.get("id")
-    return None
-
-def import_market(api_key: str, slug: str):
-    existing_id = find_simmer_market_broad(api_key, slug)
-    if existing_id: return existing_id, None, True
-
-    url = f"https://polymarket.com/event/{slug}"
-    for attempt in range(3):
-        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=90)
-        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
-            return r.get("market_id"), None, True
-        err = r.get("error") if isinstance(r, dict) else str(r)
-        if "internal server error" in str(err).lower():
-            time.sleep(2)
-            fallback_id = find_simmer_market_broad(api_key, slug)
-            if fallback_id: return fallback_id, None, True
-        time.sleep(2)
-    return None, "import_failed_after_retries", False
-
 def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
     payload = {
         "market_id": market_id,
@@ -385,41 +358,43 @@ def execute_trade(api_key: str, market_id: str, side: str, amount: float = None,
     return {"error": "max_retries_exceeded"}
 
 # -----------------------
-# IRON-CLAD CLOSE LOGIC
+# IRON-CLAD CLOSE (3-STRIKE VERIFICATION)
 # -----------------------
 def iron_clad_close(api_key: str, market_id: str):
     """
     Exits the trade and VERIFIES the wallet is 0. 
-    Will not return until the API confirms the position is closed.
+    Requires 3 CONSECUTIVE '0 share' confirmations to beat API lag.
     """
     print(f"IRON-CLAD CLOSE: Ensuring exit for market {market_id}...")
+    consecutive_zeros = 0
     
     while True:
-        # Check actual wallet balance via Data API
         r = simmer_request("/api/sdk/positions", api_key=api_key)
         positions = r.get("positions", []) if isinstance(r, dict) else []
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         
-        if not my_pos:
-            print("VERIFIED: Position is completely gone.")
-            return True
+        s_yes = float(my_pos.get("shares_yes", 0)) if my_pos else 0
+        s_no = float(my_pos.get("shares_no", 0)) if my_pos else 0
 
-        s_yes = float(my_pos.get("shares_yes", 0))
-        s_no = float(my_pos.get("shares_no", 0))
-
-        if s_yes <= 0.0001 and s_no <= 0.0001:
-            print("VERIFIED: Wallet shares at zero.")
-            return True
-
-        # If shares found, try to sell
-        if s_yes > 0:
-            print(f"ACTION: Selling {s_yes} YES shares...")
-            execute_trade(api_key, market_id, "yes", shares=s_yes, action="sell")
-        if s_no > 0:
-            print(f"ACTION: Selling {s_no} NO shares...")
-            execute_trade(api_key, market_id, "no", shares=s_no, action="sell")
+        # THREE-STRIKE RULE
+        if s_yes <= 0.001 and s_no <= 0.001:
+            consecutive_zeros += 1
+            print(f"VERIFIED: Zero shares found. Confirmation {consecutive_zeros}/3...")
+            if consecutive_zeros >= 3:
+                print("VERIFIED: Position confirmed gone x3. Safe to exit.")
+                return True
+        else:
+            # If we see shares, reset the counter to 0
+            consecutive_zeros = 0 
+            
+            if s_yes > 0:
+                print(f"ACTION: Selling {s_yes} YES shares...")
+                execute_trade(api_key, market_id, "yes", shares=s_yes, action="sell")
+            if s_no > 0:
+                print(f"ACTION: Selling {s_no} NO shares...")
+                execute_trade(api_key, market_id, "no", shares=s_no, action="sell")
         
-        time.sleep(2.0) # Buffer to prevent API spamming
+        time.sleep(2.0) # Buffer between checks
 
 def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
     if not smart_sizing: return max_size
