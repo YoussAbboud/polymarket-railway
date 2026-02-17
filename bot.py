@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.1 - No More Silencing).
+Railway-ready Simmer FastLoop bot (v7.4 - The Terminator Fix).
 
 FIXES:
-- ✅ REMOVED ERROR HIDING: Removed 'try...except: pass' that silenced API errors.
-- ✅ BLIND FAIL-SAFE: If no price data is found for 45s, FORCE CLOSES.
-- ✅ HEARTBEAT: Prints a dot "." every loop so you know it's alive.
+- ✅ NO TRUST CLOSING: Ignores API "Success" messages.
+- ✅ WALLET VERIFICATION: Loops infinitely until `get_positions` returns 0 shares.
+- ✅ SPAM SELL: If shares remain, it sends another SELL order every 2 seconds.
 """
 
 import os, sys, json, argparse, time
@@ -19,12 +19,12 @@ from urllib.error import HTTPError, URLError
 # ==============================================================================
 ASSET = "BTC"                # BTC, ETH, or SOL
 LOOKBACK_MINS = 12           # Momentum timeframe (minutes)
-MIN_MOMENTUM_PCT = 0.08      # Entry trigger threshold (%)
+MIN_MOMENTUM_PCT = 0.12      # Entry trigger threshold
 MAX_POSITION_AMOUNT = 5.0    # Default trade size in USDC
 SMART_SIZING_PCT = 0.05      # % of portfolio to use if --smart-sizing is on
 
-STOP_LOSS_PCT = 0.05         # Hard Stop Loss (0.05 = 5%)
-TAKE_PROFIT_PCT = 0.15       # Take Profit (0.15 = 15%)
+STOP_LOSS_PCT = 0.25         # Hard Stop Loss (25%)
+TAKE_PROFIT_PCT = 0.30       # Take Profit (30%)
 CLOSE_BUFFER_SECONDS = 80    # Seconds before expiry to force close
 # ==============================================================================
 
@@ -66,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.1")
+        req_headers.setdefault("User-Agent", "railway-fastloop/7.4")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -160,19 +160,38 @@ def execute_trade(api_key, market_id, side, amount=None, shares=None, action="bu
 # -----------------------
 # Logic
 # -----------------------
-def retry_close_until_success(api_key, market_id, side, shares):
-    print(f"EXIT: Selling {shares} shares of {side.upper()}...")
+def terminate_position_with_prejudice(api_key, market_id, side):
+    """
+    THE TERMINATOR: Loops endlessly checking the wallet.
+    If shares exist, it sends a SELL order.
+    It DOES NOT STOP until shares == 0.
+    """
+    print(f"\n⚡ TERMINATOR ENGAGED: Checking wallet for {side.upper()} shares...")
+    
     attempt = 1
     while True:
-        res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
-        if res.get("success"):
-            print(f"SELL SUCCESS (Attempt {attempt})")
+        # 1. CHECK WALLET
+        positions = get_positions(api_key)
+        my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+        
+        # 2. IF GONE, WE WIN
+        if not my_pos:
+            print("✅ TERMINATOR: Position is completely gone. Mission accomplished.")
             return True
-        print(f"SELL FAILED (Attempt {attempt}): {res.get('error')}. Retrying...")
-        time.sleep(1)
-        attempt += 1
+            
+        shares_left = float(my_pos.get(f"shares_{side}", 0))
+        if shares_left <= 0.001:
+             print("✅ TERMINATOR: Shares at 0. Mission accomplished.")
+             return True
 
-def monitor_and_close(api_key, market_id, end_time, side):
+        # 3. IF SHARES EXIST, KILL THEM
+        print(f"⚠️  SHARES DETECTED: {shares_left} remaining. Sending SELL (Attempt {attempt})...")
+        execute_trade(api_key, market_id, side, shares=shares_left, action="sell")
+        
+        attempt += 1
+        time.sleep(2.0) # Wait 2s and check again
+
+def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     print("MONITOR: Waiting for trade to settle...")
     time.sleep(2)
@@ -181,7 +200,8 @@ def monitor_and_close(api_key, market_id, end_time, side):
     my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
     
     shares_owned = float(my_pos.get(f"shares_{side}", 0)) if my_pos else 0
-    entry_price = float(my_pos.get("avg_buy_price", 0.5)) if my_pos else 0.5
+    entry_price = float(my_pos.get("avg_buy_price", 0)) if my_pos else 0
+    if entry_price <= 0: entry_price = est_entry_price
     
     if shares_owned <= 0:
         print(f"MONITOR ERROR: Wallet has 0 {side} shares.")
@@ -197,34 +217,37 @@ def monitor_and_close(api_key, market_id, end_time, side):
         
         # FAIL-SAFE: If no price for 45s, FORCE CLOSE
         if time.time() - last_valid_price_time > 45:
-            print("\n!!! CRITICAL WARNING: No price data for 45s. FORCE CLOSING for safety !!!")
+            print("\n!!! CRITICAL: No price data for 45s. FORCE CLOSING !!!")
             break
 
-        res = api_request(f"https://gamma-api.polymarket.com/markets/{market_id}")
+        # FETCH PRICE VIA SIMMER
+        res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
         
-        if isinstance(res, dict) and "outcomePrices" in res:
+        if isinstance(res, dict) and "outcome_prices" in res:
             try:
-                prices = json.loads(res["outcomePrices"])
-                curr_price = float(prices[0] if side == "yes" else prices[1])
-                last_valid_price_time = time.time() # Update timestamp
+                prices = res["outcome_prices"]
+                if isinstance(prices, str): prices = json.loads(prices)
+                
+                curr_price = float(prices["0" if side == "yes" else "1"])
+                last_valid_price_time = time.time()
                 
                 pnl = (curr_price - entry_price) / entry_price
-                print(f"\nPnL: {pnl*100:+.1f}% | Price: {curr_price:.3f}")
+                print(f"\rMONITOR: {side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}%   ", end="")
                 
                 if pnl <= -STOP_LOSS_PCT:
-                    print(f"STOP LOSS HIT: {pnl*100:.1f}%. Closing.")
+                    print(f"\nSTOP LOSS HIT: {pnl*100:.1f}%. Closing.")
                     break
                 if pnl >= TAKE_PROFIT_PCT:
-                    print(f"TAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
+                    print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
                     break
             except Exception as e:
-                print(f"\nDEBUG: Price parse error: {e}")
-        else:
-             print(f"\nDEBUG: Gamma API error or empty: {res.get('error', 'Unknown')}")
-             
+                pass 
+        
         time.sleep(3)
         
-    retry_close_until_success(api_key, market_id, side, shares_owned)
+    print("") 
+    # CALL THE TERMINATOR
+    terminate_position_with_prejudice(api_key, market_id, side)
 
 def run_once(live, quiet, smart_sizing):
     api_key = get_api_key()
@@ -277,11 +300,21 @@ def run_once(live, quiet, smart_sizing):
         bal = float(pf.get("balance_usdc", 0) or 0)
         amount = bal * SMART_SIZING_PCT
     
-    # Min Shares check (approx price 0.5)
-    if (amount / 0.5) < 5.0: amount = 3.0 # Force min $3 if too small
+    if (amount / 0.5) < 5.0: amount = 3.0 
+
+    # 4b. Get Est Entry Price for Monitor Fallback
+    est_entry_price = 0.5
+    market_id, _, _ = import_market(api_key, slug)
+    if market_id:
+         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
+         if isinstance(res, dict) and "outcome_prices" in res:
+             try:
+                 prices = res["outcome_prices"]
+                 if isinstance(prices, str): prices = json.loads(prices)
+                 est_entry_price = float(prices["0" if side == "yes" else "1"])
+             except: pass
 
     # 5. Execute
-    market_id, _, _ = import_market(api_key, slug)
     if not market_id:
         print("FAIL: Import error.")
         return
@@ -296,7 +329,7 @@ def run_once(live, quiet, smart_sizing):
         st["trades"] += 1
         save_state(st)
         print("TRADE: Success. Monitoring...")
-        monitor_and_close(api_key, market_id, end_time, side)
+        monitor_and_close(api_key, market_id, end_time, side, est_entry_price)
         print("CYCLE COMPLETE: Closed.")
     else:
         print(f"TRADE FAILED: {res.get('error')}")
