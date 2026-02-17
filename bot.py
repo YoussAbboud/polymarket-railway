@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v7.5 - Survival Mode).
+Railway-ready Simmer FastLoop bot (v7.6 - Never Abandon).
 
-FIXES:
-- ✅ SURVIVAL SIZING: If balance < $5, uses 90% of remaining funds automatically.
-- ✅ NO TRUST CLOSING: Ignores API "Success" messages; verifies wallet is empty.
-- ✅ TERMINATOR LOOP: Retries closing infinitely until shares are gone.
+CRITICAL FIXES:
+- ✅ REMOVED "QUIT" LOGIC: Bot will NEVER exit just because API reports 0 shares.
+- ✅ ENTRY RETRY LOOP: Waits up to 60s for shares to appear (beating API lag).
+- ✅ BLIND TERMINATOR: If shares never show up, it starts blind-selling anyway.
+- ✅ SURVIVAL MODE: Auto-detects <$5 balance and goes all-in to recover.
 """
 
 import os, sys, json, argparse, time
@@ -17,15 +18,15 @@ from urllib.error import HTTPError, URLError
 # ==============================================================================
 # 🚀 STRATEGY SETTINGS
 # ==============================================================================
-ASSET = "BTC"                # BTC, ETH, or SOL
-LOOKBACK_MINS = 12           # Momentum timeframe
-MIN_MOMENTUM_PCT = 0.12      # Entry threshold (Quality > Quantity)
-MAX_POSITION_AMOUNT = 5.0    # Cap size (will auto-adjust down if wallet is low)
-SMART_SIZING_PCT = 0.90      # SURVIVAL MODE: Use 90% of balance for max recovery chance
+ASSET = "BTC"                
+LOOKBACK_MINS = 12           
+MIN_MOMENTUM_PCT = 0.12      
+MAX_POSITION_AMOUNT = 5.0    
+SMART_SIZING_PCT = 0.95      # Survival: Use 95% of remaining funds
 
-STOP_LOSS_PCT = 0.25         # Wide Stop Loss (25%) to avoid whipsaws
-TAKE_PROFIT_PCT = 0.30       # Take Profit (30%)
-CLOSE_BUFFER_SECONDS = 80    # Seconds before expiry to force close
+STOP_LOSS_PCT = 0.25         # 25% Stop
+TAKE_PROFIT_PCT = 0.30       # 30% Profit
+CLOSE_BUFFER_SECONDS = 80    
 # ==============================================================================
 
 # -----------------------
@@ -66,7 +67,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/7.5")
+        req_headers.setdefault("User-Agent", "railway-fastloop/7.6")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -194,21 +195,33 @@ def terminate_position_with_prejudice(api_key, market_id, side):
 def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     print("MONITOR: Waiting for trade to settle...")
-    time.sleep(2)
     
-    positions = get_positions(api_key)
-    my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+    shares_owned = 0.0
+    entry_price = est_entry_price
     
-    shares_owned = float(my_pos.get(f"shares_{side}", 0)) if my_pos else 0
-    entry_price = float(my_pos.get("avg_buy_price", 0)) if my_pos else 0
-    if entry_price <= 0: entry_price = est_entry_price
-    
+    # --- STEP 1: WAIT FOR SHARES TO APPEAR (The "Never Abandon" Loop) ---
+    for i in range(20): # Try for 60 seconds (20 * 3s)
+        positions = get_positions(api_key)
+        my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+        
+        if my_pos:
+            shares_owned = float(my_pos.get(f"shares_{side}", 0))
+            if shares_owned > 0:
+                entry_price = float(my_pos.get("avg_buy_price", 0)) or est_entry_price
+                print(f"MONITOR: Shares confirmed! Tracking {shares_owned:.4f} {side.upper()} @ {entry_price:.3f}")
+                break
+        
+        print(f"MONITOR: Waiting for shares to appear in wallet... ({i+1}/20)")
+        time.sleep(3)
+
+    # --- STEP 2: IF SHARES NEVER APPEARED, ASSUME GHOST & TERMINATE ---
     if shares_owned <= 0:
-        print(f"MONITOR ERROR: Wallet has 0 {side} shares.")
+        print(f"WARNING: API never showed shares. Engaging Terminator blindly just in case.")
+        terminate_position_with_prejudice(api_key, market_id, side)
         return
 
-    print(f"MONITOR: Tracking {shares_owned:.4f} {side.upper()} @ {entry_price:.3f}. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
-
+    # --- STEP 3: PnL MONITOR ---
+    print(f"MONITOR: Live Tracking. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
     last_valid_price_time = time.time()
     
     while now_utc() < target_time:
@@ -277,8 +290,11 @@ def run_once(live, quiet, smart_sizing):
     prices = data["prices"]
     latest_ts, latest_price = prices[-1]
     target_ts = latest_ts - (LOOKBACK_MINS * 60 * 1000)
+    
     past_price = next((p for t, p in reversed(prices) if abs(t - target_ts) < 300000), None)
-    if not past_price: return
+    if not past_price: 
+        if not quiet: print("SKIP: No history found.")
+        return
 
     momentum = ((latest_price - past_price) / past_price) * 100
     if abs(momentum) < MIN_MOMENTUM_PCT:
@@ -293,18 +309,16 @@ def run_once(live, quiet, smart_sizing):
     pf = get_portfolio(api_key)
     bal = float(pf.get("balance_usdc", 0) or 0)
     
-    # If balance is low, use survival sizing (90% of everything)
     if bal < MAX_POSITION_AMOUNT:
-        print(f"⚠️ LOW BALANCE ({bal:.2f}). Engaging Survival Sizing (90%)...")
-        amount = bal * 0.90
+        print(f"⚠️ LOW BALANCE ({bal:.2f}). Engaging Survival Sizing (95%)...")
+        amount = bal * 0.95
     elif smart_sizing:
         amount = bal * SMART_SIZING_PCT
     
-    # Force float precision
     amount = float(f"{amount:.2f}")
     
-    if amount < 0.5:
-        print("SKIP: Insufficient funds (Need >$0.50).")
+    if amount < 0.2: # Polymarket might reject < $0.20, but we try
+        print(f"SKIP: Insufficient funds ({amount:.2f}). Need >$0.20.")
         return
 
     # 4b. Get Est Entry Price
@@ -334,6 +348,7 @@ def run_once(live, quiet, smart_sizing):
         st["trades"] += 1
         save_state(st)
         print("TRADE: Success. Monitoring...")
+        # CRITICAL: We pass CONTROL to the monitor. It is now responsible for life/death.
         monitor_and_close(api_key, market_id, end_time, side, est_entry_price)
         print("CYCLE COMPLETE: Closed.")
     else:
