@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v6.2 - Precision & Shortcut Fix).
+Railway-ready Simmer FastLoop bot (v5.2 - Panic Close).
 
-FIXES:
-- ✅ EQUALITY FIX: Momentum now triggers if it's EXACTLY equal to your setting.
-- ✅ SHORTCUTS: Restored -l, -q, and -s for CLI commands.
-- ✅ IRON-CLAD: Verification loop ensures no ghost positions remain.
+CHANGELOG:
+- ✅ FIX "Close Failed": Implemented 'force_close' with aggressive retries.
+- ✅ DEBUGGING: Prints FULL error message if closing fails.
+- ✅ SAFETY: Will not give up on closing until it tries 5 times or succeeds.
 """
 
 import os, sys, json, argparse, time
@@ -14,33 +14,38 @@ from datetime import datetime, timezone, timedelta
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
-# ==============================================================================
-# 🚀 STRATEGY SETTINGS (Edit these for fast updates)
-# ==============================================================================
-ASSET = "BTC"                # BTC, ETH, or SOL
-LOOKBACK_MINS = 5            # Momentum timeframe (minutes)
-MIN_MOMENTUM_PCT = 0.08      # Entry trigger threshold (%)
-MAX_POSITION_AMOUNT = 5.0    # Default trade size in USDC
-
-STOP_LOSS_PCT = 0.05         # Hard Stop Loss (0.05 = 5%)
-TAKE_PROFIT_PCT = 0.20       # Take Profit (0.20 = 20%)
-CLOSE_BUFFER_SECONDS = 80    # Buffer before expiry to force exit
-# ==============================================================================
-
 # -----------------------
-# Persistence
+# Persistence locations
 # -----------------------
 DEFAULT_DATA_DIR = "/data" if os.path.isdir("/data") else ".data"
 DATA_DIR = os.environ.get("BOT_STATE_DIR", DEFAULT_DATA_DIR)
 STATE_PATH = os.environ.get("BOT_STATE_PATH", os.path.join(DATA_DIR, "state.json"))
+JOURNAL_PATH = os.environ.get("BOT_JOURNAL_PATH", os.path.join(DATA_DIR, "trades.jsonl"))
+
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------
-# API Helpers
+# API
 # -----------------------
 SIMMER_BASE = os.environ.get("SIMMER_API_BASE", "https://api.simmer.markets")
-TRADE_SOURCE = "railway:fastloop"
 
+COINGECKO_IDS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+}
+
+TRADE_SOURCE = "railway:fastloop"
+LOCK_TTL_SECONDS = int(os.environ.get("LOCK_TTL_SECONDS", "300"))
+
+# --- STRATEGY SETTINGS ---
+CLOSE_BUFFER_SECONDS = 80   # Close 30s before end
+STOP_LOSS_PCT = 0.05        # -5% Loss
+TAKE_PROFIT_PCT = 0.15      # +15% Profit
+
+# -----------------------
+# Helpers
+# -----------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -48,7 +53,8 @@ def load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception: return default
+    except Exception:
+        return default
 
 def save_json(path: str, obj):
     tmp = path + ".tmp"
@@ -56,121 +62,577 @@ def save_json(path: str, obj):
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
 
+def append_journal(event: dict):
+    event = dict(event)
+    event["ts"] = now_utc().isoformat()
+    with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
 def api_request(url, method="GET", data=None, headers=None, timeout=25):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/6.2")
-        body = json.dumps(data).encode("utf-8") if data else None
-        if data: req_headers["Content-Type"] = "application/json"
+        req_headers.setdefault("User-Agent", "railway-fastloop/5.2")
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode("utf-8")
+            req_headers["Content-Type"] = "application/json"
+        
         req = Request(url, data=body, headers=req_headers, method=method)
         with urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"error": "non_json_response", "raw": raw[:500]}
+    except HTTPError as e:
+        try:
+            err = json.loads(e.read().decode("utf-8"))
+            return {"error": err.get("detail", str(e)), "status_code": e.code, "body": err}
+        except Exception:
+            return {"error": str(e), "status_code": e.code}
+    except URLError as e:
+        return {"error": f"Connection error: {getattr(e, 'reason', e)}"}
     except Exception as e:
         return {"error": str(e)}
 
-def simmer_request(path, method="GET", data=None, api_key=None):
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    return api_request(f"{SIMMER_BASE}{path}", method=method, data=data, headers=headers)
+def simmer_request(path, method="GET", data=None, api_key=None, timeout=45):
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return api_request(
+        f"{SIMMER_BASE}{path}",
+        method=method,
+        data=data,
+        headers=headers,
+        timeout=timeout
+    )
+
+def get_api_key():
+    key = os.environ.get("SIMMER_API_KEY")
+    if not key:
+        print("ERROR: SIMMER_API_KEY is not set")
+        sys.exit(1)
+    return key
 
 # -----------------------
-# Logic
+# Lock helpers
 # -----------------------
-def iron_clad_close(api_key, market_id):
-    print(f"IRON-CLAD CLOSE: Ensuring exit for market {market_id}...")
-    while True:
-        r = simmer_request("/api/sdk/positions", api_key=api_key)
-        positions = r.get("positions", []) if isinstance(r, dict) else []
-        my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
+def lock_path_for(key: str) -> str:
+    safe = (key or "").replace("/", "_").replace(" ", "_").replace(":", "_")
+    return os.path.join(DATA_DIR, f"lock_{safe}.json")
+
+def read_lock(key: str):
+    path = lock_path_for(key)
+    data = load_json(path, None)
+    if not isinstance(data, dict) or "ts" not in data: return None
+    try:
+        ts = datetime.fromisoformat(data["ts"])
+        if ts.tzinfo is None: ts = ts.replace(tzinfo=timezone.utc)
+        if (now_utc() - ts).total_seconds() < LOCK_TTL_SECONDS: return data
+    except Exception: return None
+    return None
+
+def has_recent_lock(key: str) -> bool: return read_lock(key) is not None
+
+def write_lock(key: str, extra: dict = None):
+    path = lock_path_for(key)
+    payload = {"ts": now_utc().isoformat(), "key": key}
+    if isinstance(extra, dict): payload.update(extra)
+    save_json(path, payload)
+
+def clear_lock(key: str):
+    path = lock_path_for(key)
+    try:
+        if os.path.exists(path): os.remove(path)
+    except Exception: pass
+
+# -----------------------
+# State helpers
+# -----------------------
+def load_state():
+    st = load_json(STATE_PATH, {})
+    if not isinstance(st, dict): st = {}
+    today = now_utc().date().isoformat()
+    if st.get("day") != today:
+        st = {"day": today, "trades": 0, "imports": 0, "last_trade_ts": None}
+    return st
+
+def save_state(st: dict):
+    save_json(STATE_PATH, st)
+
+# -----------------------
+# Position Check Helper
+# -----------------------
+def already_in_this_market(positions, slug: str, market_id: str = None):
+    target_slug = (slug or "").strip().lower()
+
+    for p in positions or []:
+        # Check by ID
+        if market_id:
+            pid = str(p.get("market_id") or p.get("id") or "")
+            if pid == str(market_id):
+                if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
+                    return True
         
-        if not my_pos:
-            print("VERIFIED: Position is completely gone.")
-            return True
+        # Check by Slug/URL
+        p_slug = str(p.get("slug") or "").lower()
+        p_url = str(p.get("polymarket_url") or "").lower()
+        
+        if target_slug and (target_slug in p_slug or target_slug in p_url):
+            if float(p.get("shares_yes", 0)) > 0 or float(p.get("shares_no", 0)) > 0:
+                return True
+                
+    return False
 
-        s_yes = float(my_pos.get("shares_yes", 0))
-        s_no = float(my_pos.get("shares_no", 0))
+# -----------------------
+# Config
+# -----------------------
+CONFIG_DEFAULTS = {
+    "asset": "BTC",
+    "window": "5m",
+    "signal_source": "coingecko",
+    "lookback_minutes": 12,
+    "entry_threshold": 0.05,
+    "min_momentum_pct": 0.08, 
+    "min_time_remaining": 45,
+    "min_volume_ratio": 0.15,
+    "max_position": 5.0, 
+    "smart_sizing_pct": 0.05,
+    "max_open_fast_positions": 2,
+    "cooldown_seconds": 80,
+    "daily_trade_limit": 20,
+    "daily_import_limit": 20,
+    "fee_edge_buffer": 0.02,
+}
 
-        if s_yes <= 0.0001 and s_no <= 0.0001:
-            print("VERIFIED: Wallet shares at zero.")
-            return True
+ENV_MAP = {
+    "asset": "SIMMER_SPRINT_ASSET",
+    "window": "SIMMER_SPRINT_WINDOW",
+    "signal_source": "SIMMER_SPRINT_SIGNAL",
+    "lookback_minutes": "SIMMER_SPRINT_LOOKBACK",
+    "entry_threshold": "SIMMER_SPRINT_ENTRY",
+    "min_momentum_pct": "SIMMER_SPRINT_MOMENTUM",
+    "min_time_remaining": "SIMMER_SPRINT_MIN_TIME",
+    "max_position": "SIMMER_SPRINT_MAX_POSITION",
+}
 
-        if s_yes > 0:
-            simmer_request("/api/sdk/trade", method="POST", api_key=api_key, 
-                           data={"market_id": market_id, "side": "yes", "action": "sell", "shares": s_yes, "venue": "polymarket"})
-        if s_no > 0:
-            simmer_request("/api/sdk/trade", method="POST", api_key=api_key, 
-                           data={"market_id": market_id, "side": "no", "action": "sell", "shares": s_no, "venue": "polymarket"})
-        time.sleep(2.0)
+def load_config():
+    cfg = dict(CONFIG_DEFAULTS)
+    file_cfg = load_json("config.json", {})
+    if isinstance(file_cfg, dict): cfg.update(file_cfg)
 
-def monitor_and_close(api_key, market_id, end_time, side):
-    target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
-    time.sleep(2)
-    r = simmer_request("/api/sdk/positions", api_key=api_key)
-    pos = next((p for p in r.get("positions", []) if str(p.get("market_id")) == str(market_id)), None)
-    entry_price = float(pos.get("avg_buy_price", 0.5)) if pos else 0.5
-    
-    while now_utc() < target_time:
-        res = api_request(f"https://gamma-api.polymarket.com/markets/{market_id}")
-        if isinstance(res, dict) and "outcomePrices" in res:
-            prices = json.loads(res["outcomePrices"])
-            curr_price = float(prices[0] if side == "yes" else prices[1])
-            pnl = (curr_price - entry_price) / entry_price
-            print(f"PnL: {pnl*100:+.1f}% | Price: {curr_price:.3f}")
-            if pnl <= -STOP_LOSS_PCT or pnl >= TAKE_PROFIT_PCT:
-                print("THRESHOLD HIT. Closing.")
-                break
-        time.sleep(1.0)
-    iron_clad_close(api_key, market_id)
+    for k, env in ENV_MAP.items():
+        v = os.environ.get(env)
+        if v is None: continue
+        if isinstance(cfg.get(k), bool):
+            cfg[k] = v.lower() in ("true", "1", "yes")
+        elif isinstance(cfg.get(k), int):
+            cfg[k] = int(v)
+        elif isinstance(cfg.get(k), float):
+            cfg[k] = float(v)
+        else:
+            cfg[k] = v
 
-def run_once(live, quiet):
-    api_key = os.environ.get("SIMMER_API_KEY")
+    cfg["asset"] = str(cfg["asset"]).upper()
+    return cfg
+
+# -----------------------
+# Market Discovery
+# -----------------------
+def get_current_window_slug(asset: str):
     now = now_utc()
     minute = (now.minute // 5) * 5
     start_dt = now.replace(minute=minute, second=0, microsecond=0)
-    slug = f"{ASSET.lower()}-updown-5m-{int(start_dt.timestamp())}"
-    end_time = start_dt + timedelta(minutes=5)
+    ts = int(start_dt.timestamp())
+    
+    asset_prefix = asset.lower()
+    if asset_prefix == "bitcoin": asset_prefix = "btc"
+    
+    slug = f"{asset_prefix}-updown-5m-{ts}"
+    end_dt = start_dt + timedelta(minutes=5)
+    
+    return {
+        "slug": slug,
+        "start_time": start_dt,
+        "end_time": end_dt,
+        "question": f"{asset} Up or Down {start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}",
+        "ts_id": ts
+    }
 
-    if not quiet: print(f"TARGET: {slug}")
+def discover_fast_markets(asset: str, window: str):
+    target = get_current_window_slug(asset)
+    return [target]
 
-    # Check for existing trade
-    r_pos = simmer_request("/api/sdk/positions", api_key=api_key)
-    if any(slug in str(p.get("slug", "")) for p in (r_pos.get("positions", []) if isinstance(r_pos, dict) else [])):
+def select_best_market(markets, min_seconds_left: int):
+    now = now_utc()
+    if not markets: return None
+    m = markets[0]
+    end = m.get("end_time")
+    left = (end - now).total_seconds()
+    if left < min_seconds_left:
+        return None
+    return m
+
+def market_window_key(slug: str) -> str:
+    return slug
+
+# -----------------------
+# Signal
+# -----------------------
+def get_coingecko_momentum(asset: str, lookback_minutes: int):
+    coin_id = COINGECKO_IDS.get(asset, "bitcoin")
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1"
+    
+    data = api_request(url, timeout=30)
+    if isinstance(data, dict) and data.get("error"):
+        return {"error": f"coingecko_error: {data.get('error')}"}
+    if not isinstance(data, dict) or "prices" not in data:
+        return {"error": "coingecko_invalid_format", "raw": str(data)[:100]}
+
+    prices = data["prices"]
+    if not prices or len(prices) < 2:
+        return {"error": "coingecko_insufficient_data"}
+
+    latest_ts, latest_price = prices[-1]
+    target_ts = latest_ts - (lookback_minutes * 60 * 1000)
+    
+    past_price = None
+    best_diff = float('inf')
+    
+    for t, p in reversed(prices):
+        diff = abs(t - target_ts)
+        if diff < best_diff:
+            best_diff = diff
+            past_price = p
+        else:
+            pass
+            
+    if past_price is None:
+        return {"error": "coingecko_history_lookup_failed"}
+        
+    momentum_pct = ((latest_price - past_price) / past_price) * 100.0
+    direction = "up" if momentum_pct > 0 else "down"
+
+    return {
+        "price_now": latest_price,
+        "price_then": past_price,
+        "momentum_pct": momentum_pct,
+        "direction": direction,
+        "volume_ratio": 1.0,
+        "source": "coingecko"
+    }
+
+# -----------------------
+# Simmer actions
+# -----------------------
+def get_positions(api_key: str):
+    r = simmer_request("/api/sdk/positions", api_key=api_key, timeout=45)
+    if isinstance(r, dict) and "positions" in r: return r["positions"]
+    if isinstance(r, list): return r
+    return []
+
+def get_portfolio(api_key: str):
+    return simmer_request("/api/sdk/portfolio", api_key=api_key, timeout=45)
+
+def find_simmer_market_broad(api_key: str, slug: str):
+    r = simmer_request(f"/api/sdk/markets?limit=100&search={slug}", api_key=api_key)
+    if isinstance(r, dict) and "markets" in r:
+        for m in r["markets"]:
+            if slug in str(m.get("slug", "")) or slug in str(m.get("polymarket_url", "")):
+                return m.get("id")
+    return None
+
+def import_market(api_key: str, slug: str):
+    existing_id = find_simmer_market_broad(api_key, slug)
+    if existing_id: return existing_id, None, True
+
+    url = f"https://polymarket.com/event/{slug}"
+    for attempt in range(3):
+        r = simmer_request("/api/sdk/markets/import", method="POST", data={"polymarket_url": url, "shared": True}, api_key=api_key, timeout=90)
+        if isinstance(r, dict) and r.get("status") in ["imported", "already_exists"]:
+            return r.get("market_id"), None, True
+        err = r.get("error") if isinstance(r, dict) else str(r)
+        if "internal server error" in str(err).lower():
+            time.sleep(2)
+            fallback_id = find_simmer_market_broad(api_key, slug)
+            if fallback_id: return fallback_id, None, True
+        time.sleep(2)
+    return None, "import_failed_after_retries", False
+
+def execute_trade(api_key: str, market_id: str, side: str, amount: float = None, shares: float = None, action: str = "buy"):
+    payload = {
+        "market_id": market_id,
+        "side": side,
+        "venue": "polymarket",
+        "source": TRADE_SOURCE,
+        "action": action,
+    }
+    if action == "sell": payload["shares"] = float(shares or 0)
+    else: payload["amount"] = float(amount or 0)
+
+    for attempt in range(3):
+        res = simmer_request("/api/sdk/trade", method="POST", data=payload, api_key=api_key, timeout=120)
+        if res and res.get("success"): return res
+        err_msg = str(res.get("error") if isinstance(res, dict) else res).lower()
+        if "market not found" in err_msg or "timeout" in err_msg:
+            time.sleep(2)
+            continue
+        return res
+    return {"error": "max_retries_exceeded"}
+
+# --- NEW: AGGRESSIVE CLOSE WRAPPER ---
+def force_close_position(api_key: str, market_id: str, side: str, shares: float):
+    """
+    Tries aggressively to close a position.
+    Prints FULL error if it fails.
+    """
+    print(f"FORCE CLOSE: Attempting to sell {shares} shares of {side.upper()}...")
+    
+    for attempt in range(1, 6): # Try 5 times
+        res = execute_trade(api_key, market_id, side, shares=shares, action="sell")
+        
+        if res.get("success"):
+            print(f"CLOSE SUCCESS: Sold {shares} shares.")
+            return True
+        
+        # LOG THE ERROR
+        print(f"CLOSE FAILED (Attempt {attempt}/5): {json.dumps(res)}")
+        time.sleep(1.5) # Wait a bit before retry
+        
+    print("CRITICAL: Failed to close position after 5 attempts.")
+    return False
+
+def calc_position_size(api_key: str, max_size: float, smart_pct: float, smart_sizing: bool):
+    if not smart_sizing: return max_size
+    pf = get_portfolio(api_key)
+    if not isinstance(pf, dict) or pf.get("error"): return max_size
+    bal = float(pf.get("balance_usdc", 0) or 0)
+    if bal <= 0: return max_size
+    return min(max_size, bal * smart_pct)
+
+# -----------------------
+# Logic: Close & Monitor
+# -----------------------
+def get_market_end_time_from_slug(slug: str):
+    try:
+        parts = slug.split("-")
+        ts = int(parts[-1])
+        return datetime.fromtimestamp(ts + 300, tz=timezone.utc)
+    except:
+        return None
+
+def get_market_price(market_id: str):
+    url = f"https://gamma-api.polymarket.com/markets/{market_id}"
+    res = api_request(url, timeout=5)
+    if isinstance(res, dict) and "outcomePrices" in res:
+        try:
+            return json.loads(res["outcomePrices"])
+        except:
+            pass
+    return None
+
+def monitor_and_close(api_key: str, market_id: str, end_time: datetime, side: str):
+    """
+    Blocks execution until 30 seconds before end_time, CHECKING PnL every 3s.
+    """
+    target_close_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    
+    # 1. Get baseline position to estimate entry
+    print("MONITOR: Fetching initial position details...")
+    time.sleep(2) # Wait for trade to settle
+    
+    positions = get_positions(api_key)
+    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
+    
+    if not my_pos:
+        print("MONITOR: Position not found (maybe delay?). Will try to track anyway.")
+        entry_price = 0.5 # fallback
+    else:
+        # Try to find avg price
+        entry_price = float(my_pos.get("avg_buy_price", 0) or my_pos.get("avg_price", 0) or 0)
+        if entry_price <= 0:
+            # Fallback to current market price
+            prices = get_market_price(market_id)
+            if prices:
+                idx = 0 if side == "yes" else 1
+                entry_price = float(prices[idx])
+            else:
+                entry_price = 0.5 # Absolute fallback
+
+    print(f"MONITOR: Tracking {side.upper()}. Entry Est: {entry_price:.3f}. Holding until {target_close_time.strftime('%H:%M:%S')}")
+    
+    while True:
+        now = now_utc()
+        if now >= target_close_time:
+            print("MONITOR: Time limit reached (30s buffer).")
+            break
+            
+        # Check Price & PnL
+        prices = get_market_price(market_id)
+        if prices and entry_price > 0:
+            idx = 0 if side == "yes" else 1
+            curr_price = float(prices[idx])
+            
+            pnl = (curr_price - entry_price) / entry_price
+            
+            print(f"MONITOR: {side.upper()} @ {curr_price:.3f} | PnL: {pnl*100:+.1f}% | Time left: {(target_close_time - now).total_seconds():.0f}s")
+            
+            if pnl <= -STOP_LOSS_PCT:
+                print(f"!!! STOP LOSS TRIGGERED ({pnl*100:.1f}%) !!! Closing...")
+                break
+            if pnl >= TAKE_PROFIT_PCT:
+                print(f"!!! TAKE PROFIT TRIGGERED ({pnl*100:.1f}%) !!! Closing...")
+                break
+        
+        time.sleep(3)
+
+    print("MONITOR: Closing position...")
+    
+    # Close logic (Updated to use force_close_position)
+    positions = get_positions(api_key)
+    my_pos = next((p for p in positions if str(p.get("market_id") or p.get("id")) == str(market_id)), None)
+            
+    if not my_pos:
+        print("MONITOR: Position gone. Already closed?")
         return
 
-    # Signal
-    b_res = api_request(f"https://api.binance.com/api/v3/klines?symbol={ASSET}USDT&interval=1m&limit=15")
-    if "error" in b_res: return
-    closes = [float(x[4]) for x in b_res]
-    momentum = ((closes[-1] - closes[-LOOKBACK_MINS]) / closes[-LOOKBACK_MINS]) * 100
+    shares_yes = float(my_pos.get("shares_yes", 0) or 0)
+    shares_no  = float(my_pos.get("shares_no", 0) or 0)
     
-    # PRECISION FIX: Added 0.0001 tolerance for equality
-    if abs(momentum) < (MIN_MOMENTUM_PCT - 0.0001):
-        if not quiet: print(f"SKIP: Weak momentum ({momentum:.3f}%)")
-        return
-    
-    side = "yes" if momentum > 0 else "no"
-    print(f"SIGNAL: {side.upper()} | Momentum: {momentum:.3f}%")
+    if shares_yes > 0:
+        force_close_position(api_key, market_id, "yes", shares_yes)
+    if shares_no > 0:
+        force_close_position(api_key, market_id, "no", shares_no)
 
-    # Import & Trade
-    m_res = simmer_request("/api/sdk/markets/import", method="POST", api_key=api_key, 
-                           data={"polymarket_url": f"https://polymarket.com/event/{slug}", "shared": True})
-    market_id = m_res.get("market_id")
-    if not market_id: return
+def check_safety_close(api_key: str, positions):
+    now = now_utc()
+    for p in positions or []:
+        slug = p.get("slug")
+        if not slug: continue
+        
+        end_time = get_market_end_time_from_slug(slug)
+        if not end_time: continue
+        
+        seconds_left = (end_time - now).total_seconds()
+        
+        if seconds_left < CLOSE_BUFFER_SECONDS:
+            print(f"SAFETY: Found position {slug} near expiry ({seconds_left:.0f}s left). Closing now.")
+            market_id = p.get("market_id") or p.get("id")
+            shares_yes = float(p.get("shares_yes", 0) or 0)
+            shares_no  = float(p.get("shares_no", 0) or 0)
+            
+            if shares_yes > 0:
+                force_close_position(api_key, market_id, "yes", shares_yes)
+            if shares_no > 0:
+                force_close_position(api_key, market_id, "no", shares_no)
+
+def run_once(cfg, live: bool, quiet: bool, smart_sizing: bool):
+    def log(msg, force=False):
+        if not quiet or force: print(msg)
+
+    api_key = get_api_key()
+    st = load_state()
+
+    # 1. Safety Check
+    positions = get_positions(api_key)
+    check_safety_close(api_key, positions)
+
+    # 2. Market Discovery
+    markets = discover_fast_markets(cfg["asset"], cfg["window"])
+    best = select_best_market(markets, int(cfg["min_time_remaining"]))
+    
+    if not best:
+        log("SKIP: Time window too close to end.", force=True)
+        return
+
+    log(f"TARGET: {best['slug']} (End: {best['end_time'].strftime('%H:%M')})", force=True)
+
+    window_key = market_window_key(best["slug"])
+    if has_recent_lock(window_key):
+        log("SKIP: Recent lock.", force=False)
+        return
+    if already_in_this_market(positions, best["slug"]):
+        log("SKIP: Already in this market.", force=True)
+        return
+
+    # 3. Signal
+    sig = get_coingecko_momentum(cfg["asset"], int(cfg["lookback_minutes"]))
+    if not sig or sig.get("error"):
+        log(f"SKIP: Signal error -> {sig}", force=True)
+        return
+
+    mom_pct = sig["momentum_pct"]
+    if abs(mom_pct) < float(cfg["min_momentum_pct"]):
+        log(f"SKIP: Weak momentum {mom_pct:.3f}%", force=True)
+        return
+
+    side = "yes" if sig["direction"] == "up" else "no"
+    
+    # 3b. Price Check for Min Shares
+    buy_price = 0.5 
+    try:
+        prices = json.loads(best.get("outcome_prices", "[]"))
+        if prices and len(prices) >= 2:
+            buy_price = float(prices[0]) if side == "yes" else float(prices[1])
+    except: pass
+
+    amount = calc_position_size(api_key, float(cfg["max_position"]), float(cfg["smart_sizing_pct"]), smart_sizing)
+    
+    # Enforce Min Shares (5.0)
+    min_shares = 5.0
+    estimated_shares = amount / buy_price if buy_price > 0 else 0
+    
+    if estimated_shares < min_shares:
+        required_amount = (min_shares * buy_price) * 1.05
+        if required_amount > float(cfg["max_position"]) * 3:
+            log(f"SKIP: Required amount ${required_amount:.2f} too high.", force=True)
+            return
+        log(f"ADJUST: Bumping amount to ${required_amount:.2f} to meet 5 share min.")
+        amount = required_amount
+
+    if amount < 1.0:
+        log("SKIP: Amount too small.", force=True)
+        return
+
+    log(f"SIGNAL: {side.upper()} | Mom={mom_pct:.3f}% | Price={buy_price:.2f}", force=True)
+    write_lock(window_key, {"status": "pending"})
+
+    # 4. Execution
+    market_id, err, imported = import_market(api_key, best["slug"])
+    if not market_id:
+        log(f"FAIL: Import {err}", force=True)
+        clear_lock(window_key)
+        return
 
     if not live:
-        print(f"DRY RUN: Would buy {side.upper()}")
+        log(f"DRY RUN: Buy {side} ${amount}", force=True)
         return
 
-    t_res = simmer_request("/api/sdk/trade", method="POST", api_key=api_key, 
-                           data={"market_id": market_id, "side": side, "action": "buy", "amount": MAX_POSITION_AMOUNT, "venue": "polymarket"})
-    
-    if t_res.get("success"):
-        monitor_and_close(api_key, market_id, end_time, side)
+    res = execute_trade(api_key, market_id, side, amount=amount)
+    if res and res.get("success"):
+        st["trades"] = int(st.get("trades", 0)) + 1
+        st["last_trade_ts"] = now_utc().isoformat()
+        save_state(st)
+        log("TRADE: Success. Entering Monitor Mode...", force=True)
+        
+        write_lock(window_key, {"status": "active", "slug": best["slug"]})
+        
+        # 5. BLOCKING MONITOR (with SL/TP)
+        monitor_and_close(api_key, market_id, best["end_time"], side)
+        
+        log("CYCLE COMPLETE: Trade closed.", force=True)
+        write_lock(window_key, {"status": "closed", "slug": best["slug"]})
+        
+    else:
+        log(f"TRADE: Failed -> {res}", force=True)
+        clear_lock(window_key)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # RESTORED SHORTCUTS
-    parser.add_argument("--live", "-l", action="store_true")
-    parser.add_argument("--quiet", "-q", action="store_true")
-    parser.add_argument("--smart-sizing", "-s", action="store_true")
+    parser.add_argument("--live", action="store_true", help="Execute real trades (default dry-run)")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Only output signal/errors")
+    parser.add_argument("--smart-sizing", action="store_true", help="Use portfolio based sizing")
     args = parser.parse_args()
-    run_once(args.live, args.quiet)
+
+    cfg = load_config()
+    run_once(cfg, live=args.live, quiet=args.quiet, smart_sizing=args.smart_sizing)
