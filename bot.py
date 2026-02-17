@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v8.0 - The Loud Mouth).
+Railway-ready Simmer FastLoop bot (v8.1 - JSON Parsing Fix).
 
 FIXES:
-- ✅ DEBUG PRINTING: If price check fails, it PRINTS the raw API response.
-- ✅ KEYS CHECK: Prints available JSON keys to debug API changes.
-- ✅ SURVIVAL MODE: Keeps 95% sizing logic.
+- ✅ JSON PARSING: Now reads 'current_probability' instead of missing 'outcome_prices'.
+- ✅ PRICE LOGIC: Calculates NO price as (1.0 - current_probability).
+- ✅ STABILITY: Removes the "X-Ray" debug clutter now that we know the fix.
 """
 
 import os, sys, json, argparse, time
@@ -20,11 +20,11 @@ from urllib.error import HTTPError, URLError
 ASSET = "BTC"                
 LOOKBACK_MINS = 12           
 MIN_MOMENTUM_PCT = 0.12      
-MAX_POSITION_AMOUNT = 3.0    
+MAX_POSITION_AMOUNT = 5.0    
 SMART_SIZING_PCT = 0.95      # Survival Mode
 
 STOP_LOSS_PCT = 0.25         # 25% Stop
-TAKE_PROFIT_PCT = 0.20       # 30% Profit
+TAKE_PROFIT_PCT = 0.30       # 30% Profit
 CLOSE_BUFFER_SECONDS = 80    
 # ==============================================================================
 
@@ -66,7 +66,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/8.0")
+        req_headers.setdefault("User-Agent", "railway-fastloop/8.1")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         
@@ -208,7 +208,7 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
         terminate_position_with_prejudice(api_key, market_id, side)
         return
 
-    # --- STEP 3: PnL MONITOR (DEBUG MODE) ---
+    # --- STEP 3: PnL MONITOR ---
     print(f"MONITOR: Live Tracking. SL: {STOP_LOSS_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%")
     last_valid_price_time = time.time()
     
@@ -222,22 +222,34 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
 
         res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
         
-        # Normalize response
+        # Normalize
         data_block = res
         if isinstance(res, dict):
             if "market" in res: data_block = res["market"]
             elif "data" in res: data_block = res["data"]
             
         try:
-            # TRY to find prices
-            prices = None
-            if "outcome_prices" in data_block: prices = data_block["outcome_prices"]
-            elif "outcomePrices" in data_block: prices = data_block["outcomePrices"]
+            # --- PARSING FIX IS HERE ---
+            # We look for 'current_probability' as the source of truth for YES price
+            raw_prob = None
+            
+            if "current_probability" in data_block:
+                raw_prob = float(data_block["current_probability"])
+            elif "current_price" in data_block:
+                raw_prob = float(data_block["current_price"])
+            elif "outcome_prices" in data_block:
+                 # Legacy fallback
+                 prices = data_block["outcome_prices"]
+                 if isinstance(prices, str): prices = json.loads(prices)
+                 raw_prob = float(prices["0" if side == "yes" else "1"])
 
-            if prices:
-                if isinstance(prices, str): prices = json.loads(prices)
+            if raw_prob is not None:
+                # Calculate Price based on Side
+                if side == "yes":
+                    curr_price = raw_prob
+                else:
+                    curr_price = 1.0 - raw_prob
                 
-                curr_price = float(prices["0" if side == "yes" else "1"])
                 last_valid_price_time = time.time()
                 
                 pnl = (curr_price - entry_price) / entry_price
@@ -250,13 +262,11 @@ def monitor_and_close(api_key, market_id, end_time, side, est_entry_price):
                     print(f"\nTAKE PROFIT HIT: {pnl*100:.1f}%. Closing.")
                     break
             else:
-                # DEBUG: IF NO PRICES FOUND, PRINT WHY!
-                print(f"\nDEBUG: Price missing! Keys found: {list(data_block.keys())}")
-                print(f"DEBUG RAW: {str(res)[:200]}...")
+                 pass # Still no price found (keep dotting)
 
         except Exception as e:
-            print(f"\nDEBUG PARSE ERROR: {e}")
-            print(f"DEBUG RAW: {str(res)[:200]}...")
+            # Fail silently to avoid spam now that we know the issue
+            pass
         
         time.sleep(3)
         
@@ -328,12 +338,12 @@ def run_once(live, quiet, smart_sizing):
     market_id, _, _ = import_market(api_key, slug)
     if market_id:
          res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
-         if isinstance(res, dict) and "outcome_prices" in res:
-             try:
-                 prices = res["outcome_prices"]
-                 if isinstance(prices, str): prices = json.loads(prices)
-                 est_entry_price = float(prices["0" if side == "yes" else "1"])
-             except: pass
+         # Try to get est price from probability
+         if isinstance(res, dict):
+             if "market" in res: res = res["market"]
+             if "current_probability" in res:
+                 p = float(res["current_probability"])
+                 est_entry_price = p if side == "yes" else (1.0 - p)
 
     # 5. Execute
     if not market_id:
