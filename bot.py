@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v10.5 - The Doctor).
+Railway-ready Direct Polymarket Bot (v10.6 - Magic Link Enforcer).
 
 CRITICAL FIXES:
-- 🩺 AUTO-DIAGNOSIS: Calculates if you are Type 1 (EOA) or Type 2 (Proxy) mathematically.
-- 🧹 WHITESPACE CLEANER: Strips invisible spaces from API keys that cause "Invalid Signature".
-- 🛡️ FAILSAFE AUTH: If math fails, tries both methods before giving up.
+- 🪄 TYPE 1 FORCED: Hardcodes signature_type=1 (PolyProxy) which is required for Email/Google login.
+- 🔑 FRESH KEY GEN: Uses 'create_or_derive_api_creds' to ensure we have valid L2 keys.
+- 🧹 CLEANUP: Strips invisible spaces from your Railway variables.
 """
 
 import os, sys, json, time, argparse, requests
@@ -13,7 +13,6 @@ from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
-from eth_account import Account
 
 # ==============================================================================
 # 🚀 STRATEGY SETTINGS
@@ -45,44 +44,29 @@ def get_env(key):
     if not val:
         print(f"❌ ERROR: Missing Env Variable: {key}")
         sys.exit(1)
-    return val.strip() # <--- CRITICAL FIX: Removes invisible spaces
+    return val.strip() # Remove invisible spaces
 
-def init_client_auto():
-    """Diagnoses the wallet type and returns the correct Client."""
+def init_client_magic():
+    """Forces Type 1 Auth (Magic Link / PolyProxy)."""
     pk = get_env("PRIVATE_KEY")
     fund_addr = get_env("POLYGON_ADDRESS") 
     
-    # 1. DERIVE ADDRESS FROM KEY
+    print(f"🔐 INITIALIZING MAGIC LINK CLIENT...")
+    print(f"   -> Signer: (Hidden)")
+    print(f"   -> Funder: {fund_addr}")
+
     try:
-        signer_account = Account.from_key(pk)
-        signer_addr = signer_account.address
-    except Exception as e:
-        print(f"❌ FATAL: Private Key is invalid format. {e}")
-        sys.exit(1)
-
-    print(f"🔍 DIAGNOSIS RUNNING...")
-    print(f"   -> Private Key Signer: {signer_addr}")
-    print(f"   -> Deposit Wallet:     {fund_addr}")
-
-    # 2. COMPARE
-    if signer_addr.lower() == fund_addr.lower():
-        print("✅ MATCH: You are a Standard User (Type 1).")
-        sig_type = 1
-        funder = None # Standard users fund themselves
-    else:
-        print("✅ MISMATCH: You are a Proxy User (Type 2).")
-        print("   (The Key signs, but the Wallet pays. Linking them now...)")
-        sig_type = 2
-        funder = fund_addr
-
-    # 3. INITIALIZE
-    try:
-        client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
-        # Refresh Creds
-        client.set_api_creds(client.create_or_derive_api_creds())
+        # SIGNATURE_TYPE 1 = PolyProxy (Magic Link / Email)
+        client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=1, funder=fund_addr)
+        
+        # Force refresh credentials
+        client.set_api_creds(client.create_or_derive_api_creds()) 
+        print("✅ AUTH SUCCESS: Type 1 (Magic/Proxy) Connected.")
         return client
     except Exception as e:
-        print(f"❌ Auth Failed: {e}")
+        print(f"❌ AUTH FAILED: {e}")
+        print("👉 VERIFY: Is your PRIVATE_KEY from 'reveal.magic.link'?")
+        print("👉 VERIFY: Is your POLYGON_ADDRESS the 'Deposit Address' on the website?")
         sys.exit(1)
 
 def get_market_tokens(slug):
@@ -118,9 +102,8 @@ def get_price_history():
 # Core Logic
 # -----------------------
 def run_strategy(live, quiet):
-    client = init_client_auto()
-    print("✅ BOT ONLINE. Ready to trade.")
-
+    client = init_client_magic()
+    
     # 1. Calculate Target
     now = datetime.now(timezone.utc)
     minute = (now.minute // 5) * 5
@@ -192,8 +175,6 @@ def run_strategy(live, quiet):
             monitor_trade(client, token_to_buy, limit_price, end_time)
         else:
             print(f"❌ Order Rejected: {resp}")
-            if "invalid signature" in str(resp).lower():
-                 print("👉 ERROR PERSISTS: This usually means your PRIVATE_KEY is wrong, OR you need to enable 'Gnosis Safe' in Polymarket Settings.")
             
     except Exception as e:
         print(f"❌ Trade Failed: {e}")
