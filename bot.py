@@ -1,30 +1,27 @@
 #!/usr/bin/env python3
 """
-Railway-ready Polymarket BTC 5m Bot (v11.0)
+Railway-ready Polymarket BTC 5m Bot (v11.1)
 
-✅ Keeps your strategy intact (momentum signal + $5 cap + 5m market)
-✅ Uses proxy/safe signing workaround that you confirmed opens orders
-✅ FIXES monitoring:
-   - parses the EXACT slug window end-time
-   - waits for the BUY fill (so PnL is meaningful)
-   - AUTO-CLOSES with a SELL when TP/SL hit OR close-buffer reached
-   - prevents the “monitor complete instantly while position still open” issue
+Fixes:
+- ✅ SignedOrder JSON serialization for manual POST /order
+- ✅ Monitoring auto-close (TP/SL + close buffer) kept
 
 ENV REQUIRED:
-- PRIVATE_KEY        (signer private key)
-- POLYGON_ADDRESS    (FUNDER / proxy wallet shown on Polymarket)
+- PRIVATE_KEY
+- POLYGON_ADDRESS  (FUNDER / proxy wallet shown on Polymarket)
 OPTIONAL:
-- SIGNATURE_TYPE     (force: 2, 1, or 0). If not set: tries [2, 1, 0]
+- SIGNATURE_TYPE   (force 2, 1, or 0). If not set: tries [2,1,0]
 """
 
 import os, sys, json, time, argparse, requests
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
 
-# --- Use py_clob_client HMAC helper if available (preferred) ---
+# py_clob_client HMAC helper (preferred)
 try:
     from py_clob_client.signing.hmac import build_hmac_signature
 except Exception:
@@ -35,11 +32,11 @@ except Exception:
 # ==============================================================================
 ASSET = "BTC"
 LOOKBACK_MINS = 12
-MIN_MOMENTUM_PCT = 0.08      # (you lowered it in your latest run)
+MIN_MOMENTUM_PCT = 0.08
 
 # --- SAFETY SETTINGS ---
 MAX_BET_SIZE = 5.0
-STOP_LOSS_PCT = 0.10
+STOP_LOSS_PCT = 0.15
 TAKE_PROFIT_PCT = 0.15
 CLOSE_BUFFER_SECONDS = 60
 STAGNATION_TIMEOUT = 20
@@ -47,11 +44,10 @@ STAGNATION_TIMEOUT = 20
 
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
-
 GAMMA_URL = "https://gamma-api.polymarket.com/events"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
 
-# Polymarket L2 headers (string keys — avoids fragile internal imports)
+# Polymarket L2 headers (string keys — stable)
 H_POLY_ADDRESS = "POLY_ADDRESS"
 H_POLY_SIGNATURE = "POLY_SIGNATURE"
 H_POLY_TIMESTAMP = "POLY_TIMESTAMP"
@@ -91,12 +87,49 @@ def checksum_lower(addr: str) -> str:
         a = "0x" + a
     return a.lower()
 
+def to_primitive(x: Any) -> Any:
+    """
+    Convert SignedOrder / pydantic / dataclasses / objects into JSON-serializable primitives.
+    """
+    if x is None:
+        return None
+    if isinstance(x, (str, int, float, bool)):
+        return x
+    if isinstance(x, (list, tuple, set)):
+        return [to_primitive(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): to_primitive(v) for k, v in x.items()}
+
+    # pydantic v2
+    if hasattr(x, "model_dump") and callable(getattr(x, "model_dump")):
+        try:
+            return to_primitive(x.model_dump())
+        except Exception:
+            pass
+
+    # pydantic v1
+    if hasattr(x, "dict") and callable(getattr(x, "dict")):
+        try:
+            return to_primitive(x.dict())
+        except Exception:
+            pass
+
+    # dataclass / generic object
+    if hasattr(x, "__dict__"):
+        try:
+            return to_primitive(vars(x))
+        except Exception:
+            pass
+
+    # fallback
+    return str(x)
+
 
 # ==============================================================================
-# Polymarket client init + signing workaround
+# Client init + POST /order workaround
 # ==============================================================================
 def init_client(signature_type: int, pk: str, funder: str) -> ClobClient:
-    log("🔐 Initializing Polymarket auth with signature_type=%s ..." % signature_type)
+    log(f"🔐 Initializing Polymarket auth with signature_type={signature_type} ...")
     client = ClobClient(
         host=HOST,
         key=pk,
@@ -106,7 +139,6 @@ def init_client(signature_type: int, pk: str, funder: str) -> ClobClient:
     )
     client.set_api_creds(client.create_or_derive_api_creds())
 
-    # tag for later header logic
     client._sig_type = signature_type
     client._funder = funder
 
@@ -125,36 +157,27 @@ def init_client(signature_type: int, pk: str, funder: str) -> ClobClient:
 
 def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="GTC", post_only=False):
     """
-    Manual POST /order with correct L2 HMAC headers and POLY_ADDRESS.
+    Manual POST /order using correct L2 HMAC headers and POLY_ADDRESS.
 
-    Key detail for proxy/safe wallets:
-      - signature_type 1/2: POLY_ADDRESS should be the FUNDER/proxy wallet
-      - signature_type 0:   POLY_ADDRESS should be signer
+    For proxy/safe wallets:
+      signature_type 1/2: POLY_ADDRESS = FUNDER/proxy wallet
+      signature_type 0:   POLY_ADDRESS = signer
     """
-
     if build_hmac_signature is None:
         raise RuntimeError(
             "build_hmac_signature not available from py_clob_client. "
-            "Install/upgrade py-clob-client or pin the version you had when orders were working."
+            "Pin/upgrade py-clob-client to a version that includes py_clob_client.signing.hmac"
         )
 
     creds = getattr(client, "creds", None)
     if creds is None:
         raise RuntimeError("Missing L2 creds; did you call set_api_creds()?")
 
-    # Build the exact JSON body the CLOB expects.
-    # We avoid importing fragile internal serializers by using the client's own create_order output:
-    # signed_order is already the correct order struct; the client expects:
-    # { order, owner, orderType, apiKey, ... } but py_clob_client already knows that shape.
-    # The cleanest stable approach is to call client.post_order() —
-    # BUT you had invalid signature there, so we reproduce the same request with fixed POLY_ADDRESS.
-
-    # We use the client's internal request builder if it exists; otherwise minimal body.
-    body = None
+    # Build request body (then convert to primitives)
     if hasattr(client, "build_post_order_body"):
         body = client.build_post_order_body(signed_order, order_type=order_type, post_only=post_only)
     else:
-        # fallback: common shape used by py_clob_client
+        # Common shape; CLOB accepts this in practice with py_clob_client derived creds.
         body = {
             "order": signed_order,
             "owner": getattr(client, "_funder", None) or client.signer.address(),
@@ -163,6 +186,7 @@ def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="
             "postOnly": bool(post_only),
         }
 
+    body = to_primitive(body)
     serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
     ts = int(time.time())
@@ -181,7 +205,7 @@ def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="
 
     poly_addr = signer_addr
     if sig_type in (1, 2) and funder:
-        poly_addr = funder  # ✅ proxy/safe
+        poly_addr = funder
 
     headers = {
         "Content-Type": "application/json",
@@ -223,11 +247,7 @@ def get_market_tokens(slug: str):
     except Exception:
         return None
 
-
 def find_current_market(asset: str):
-    """
-    Try current + adjacent windows (Gamma can lag).
-    """
     base_ts = floor_to_5m(now_utc())
     candidates = [base_ts, base_ts - 300, base_ts + 300, base_ts - 600, base_ts + 600]
     tried = []
@@ -236,8 +256,8 @@ def find_current_market(asset: str):
         tried.append(slug)
         tokens = get_market_tokens(slug)
         if tokens:
-            return slug, tokens, parse_slug_end_time(slug), tried
-    return None, None, None, tried
+            return slug, tokens, tried
+    return None, None, tried
 
 
 # ==============================================================================
@@ -285,7 +305,6 @@ def best_bid(client: ClobClient, token_id: str) -> float:
     return 0.5
 
 def get_market_params(client: ClobClient, token_id: str) -> tuple[str, bool]:
-    # Use official public methods (stable)
     tick_size = client.get_tick_size(token_id)
     neg_risk = client.get_neg_risk(token_id)
     return str(tick_size if tick_size is not None else "0.01"), bool(neg_risk)
@@ -314,13 +333,8 @@ def safe_midpoint(client, token_id: str) -> float | None:
         return None
 
 def wait_for_fill(client, order_id: str, timeout_s: int = 35):
-    """
-    Returns (filled_size, avg_fill_price, status_string).
-    Handles different response shapes gracefully.
-    """
     deadline = time.time() + timeout_s
     last = (0.0, None, "unknown")
-
     while time.time() < deadline:
         try:
             if hasattr(client, "get_order"):
@@ -334,32 +348,20 @@ def wait_for_fill(client, order_id: str, timeout_s: int = 35):
                 avg = o.get("avg_fill_price") or o.get("averageFillPrice") or o.get("avgFillPrice")
                 avg = float(avg) if avg is not None else None
                 last = (filled, avg, status)
-
-                # return as soon as there is any fill
                 if filled > 0:
                     return filled, avg, status
         except Exception:
             pass
-
         time.sleep(1.5)
-
     return last
 
 def best_marketable_sell_price(client, token_id: str, tick_size: str) -> float:
-    """
-    Try to sell quickly:
-    - prefer best bid - 1 tick (slightly more marketable)
-    - keep within [0.01, 0.99]
-    """
     try:
         tick = float(tick_size or "0.01")
     except Exception:
         tick = 0.01
-
     b = best_bid(client, token_id)
-    px = b - tick
-    px = max(0.01, min(px, 0.99))
-    # snap to 2 decimals (CLOB prices are usually 0.01 tick)
+    px = max(0.01, min(b - tick, 0.99))
     return round(px, 2)
 
 def monitor_trade_and_close(
@@ -376,7 +378,6 @@ def monitor_trade_and_close(
     end_time = parse_slug_end_time(slug)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
 
-    # Wait briefly for fill so PnL makes sense
     filled_size, avg_fill, status = wait_for_fill(client, buy_order_id, timeout_s=35)
     effective_entry = float(avg_fill) if avg_fill is not None else float(entry_price)
 
@@ -385,7 +386,6 @@ def monitor_trade_and_close(
     else:
         log(f"⚠️ Buy not filled yet (status={status}). Will still attempt timed close later.")
 
-    # If already past the close buffer, close immediately (fixes instant “monitor complete”)
     if now_utc() >= target_time:
         log("⏳ Close buffer reached immediately — attempting close now.")
         if filled_size > 0:
@@ -397,7 +397,6 @@ def monitor_trade_and_close(
             log("⚠️ No filled size detected to close yet.")
         return
 
-    # Monitor loop until TP/SL hit or close buffer time
     last_print = 0.0
     stagnation_start = time.time()
     last_mid = None
@@ -408,7 +407,6 @@ def monitor_trade_and_close(
             time.sleep(2)
             continue
 
-        # stagnation check (kept from your style)
         if mid == last_mid:
             if time.time() - stagnation_start >= STAGNATION_TIMEOUT:
                 log("❄️ STAGNATION. Will close at buffer.")
@@ -419,7 +417,6 @@ def monitor_trade_and_close(
 
         pnl = (mid - effective_entry) / effective_entry
 
-        # print every ~2s
         if time.time() - last_print >= 2:
             log(f"⏱️ Price: {mid:.3f} | PnL: {pnl*100:+.1f}% | closes at {target_time.time()} UTC")
             last_print = time.time()
@@ -433,7 +430,6 @@ def monitor_trade_and_close(
 
         time.sleep(2)
 
-    # refresh fill size right before closing
     filled2, avg2, _ = wait_for_fill(client, buy_order_id, timeout_s=6)
     if filled2 > 0:
         filled_size = filled2
@@ -453,7 +449,7 @@ def monitor_trade_and_close(
 
 
 # ==============================================================================
-# Main strategy runner
+# Main
 # ==============================================================================
 def run_strategy(live: bool):
     pk = get_env("PRIVATE_KEY")
@@ -461,7 +457,7 @@ def run_strategy(live: bool):
 
     log(f"🕒 Now UTC: {now_utc().isoformat()} | live={live}")
 
-    slug, tokens, _, tried = find_current_market(ASSET)
+    slug, tokens, tried = find_current_market(ASSET)
     if not slug or not tokens:
         log("❌ No market found on Gamma for current window.")
         for s in tried:
@@ -490,8 +486,6 @@ def run_strategy(live: bool):
         log("🟡 Not live mode (--live not set). Exiting without placing order.")
         return
 
-    # Signature types:
-    # 2 then 1 then 0 unless forced by SIGNATURE_TYPE
     sig_env = os.getenv("SIGNATURE_TYPE", "").strip()
     if sig_env.isdigit():
         sig_candidates = [int(sig_env)]
@@ -508,7 +502,6 @@ def run_strategy(live: bool):
             log(f"🧩 Market params: tick_size={tick_size} | neg_risk={neg_risk}")
 
             a = best_ask(client, token_to_buy)
-            # buy slightly above ask but cap at 0.99
             limit_price = min(a + float(tick_size or "0.01"), 0.99)
             limit_price = round(limit_price, 2)
 
@@ -523,7 +516,6 @@ def run_strategy(live: bool):
 
             log(f"✅ ORDER PLACED: {order_id}")
 
-            # ✅ monitor + auto-close
             monitor_trade_and_close(
                 client=client,
                 slug=slug,
