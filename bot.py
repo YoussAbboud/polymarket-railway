@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Railway-ready Simmer FastLoop bot (v9.5 - Stagnation Kill Switch).
+Railway-ready Simmer FastLoop bot (v9.8 - Paranoid Exit Protocol).
 
-NEW FEATURE:
-- ❄️ STAGNATION EXIT: If price/PnL doesn't move for 20 seconds, the bot sells immediately.
-
-SAFETY FEATURES (RETAINED):
-- 🛡️ HARD CAP: Max bet is $5.00. Never bets full wallet unless balance < $5.
-- ✅ STRICT VERIFICATION: Confirms shares in wallet before monitoring or exiting.
-- 🛑 CIRCUIT BREAKER: Shuts down on Stop Loss hit.
+CRITICAL FIXES:
+- 🔫 BLIND SWEEP: Ignores "Wallet Empty" lies. Forces SELL of known_shares repeatedly.
+- 🔥 OVERKILL: Sends 3 extra "Cleanup" sells after the trade is technically closed.
+- 🛡️ HARD CAP: Defaults to $5.00 safety limit.
+- ❄️ STAGNATION: Retains the 20s stuck-price kill switch.
 """
 
 import os, sys, json, argparse, time
@@ -23,12 +21,12 @@ LOOKBACK_MINS = 12
 MIN_MOMENTUM_PCT = 0.12      
 
 # --- SAFETY SETTINGS ---
-MAX_POSITION_AMOUNT = 10.0    # HARD LIMIT.
+MAX_POSITION_AMOUNT = 5.0    # Back to $5 safety cap
 STOP_LOSS_PCT = 0.10         
-TAKE_PROFIT_PCT = 0.10       
-CLOSE_BUFFER_SECONDS = 80    
+TAKE_PROFIT_PCT = 0.11       
+CLOSE_BUFFER_SECONDS = 90    
 COOLDOWN_SECONDS = 60
-STAGNATION_TIMEOUT = 20      # Seconds of flat price before forced exit
+STAGNATION_TIMEOUT = 20      
 # ==============================================================================
 
 # -----------------------
@@ -37,6 +35,7 @@ STAGNATION_TIMEOUT = 20      # Seconds of flat price before forced exit
 DEFAULT_DATA_DIR = "/data" if os.path.isdir("/data") else ".data"
 DATA_DIR = os.environ.get("BOT_STATE_DIR", DEFAULT_DATA_DIR)
 COOLDOWN_PATH = os.path.join(DATA_DIR, "last_close.json")
+MEMORY_PATH = os.path.join(DATA_DIR, "active_trade_memory.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # -----------------------
@@ -68,7 +67,7 @@ def save_json(path: str, obj):
 def api_request(url, method="GET", data=None, headers=None, timeout=10):
     try:
         req_headers = headers or {}
-        req_headers.setdefault("User-Agent", "railway-fastloop/9.5")
+        req_headers.setdefault("User-Agent", "railway-fastloop/9.8")
         body = json.dumps(data).encode("utf-8") if data else None
         if data: req_headers["Content-Type"] = "application/json"
         req = Request(url, data=body, headers=req_headers, method=method)
@@ -89,10 +88,25 @@ def get_api_key():
     return key
 
 # -----------------------
-# Cooldown
+# Memory & Cooldown
 # -----------------------
 def record_close_time():
     save_json(COOLDOWN_PATH, {"timestamp": now_utc().timestamp()})
+    if os.path.exists(MEMORY_PATH):
+        os.remove(MEMORY_PATH)
+
+def save_active_memory(shares, side, entry_price, market_id, token_id):
+    save_json(MEMORY_PATH, {
+        "shares": shares,
+        "side": side,
+        "entry_price": entry_price,
+        "market_id": market_id,
+        "token_id": token_id,
+        "timestamp": now_utc().timestamp()
+    })
+
+def load_active_memory():
+    return load_json(MEMORY_PATH, {})
 
 def check_and_wait_cooldown():
     data = load_json(COOLDOWN_PATH, {})
@@ -155,7 +169,6 @@ def wait_for_entry(api_key, market_id, side):
                     ids = my_pos["clob_token_ids"]
                     if isinstance(ids, str): ids = json.loads(ids)
                     token_id = ids.get("0" if side == "yes" else "1")
-                
                 if not token_id:
                      res = simmer_request(f"/api/sdk/markets/{market_id}", api_key=api_key)
                      data = res.get("market") or res.get("data") or {}
@@ -165,6 +178,7 @@ def wait_for_entry(api_key, market_id, side):
                         token_id = ids.get("0" if side == "yes" else "1")
 
                 print(f"✅ ENTRY CONFIRMED: {shares_found} {side.upper()} shares @ {entry_price:.3f}")
+                save_active_memory(shares_found, side, entry_price, market_id, token_id)
                 return shares_found, entry_price, token_id
                 
         print(f"⏳ Waiting for shares... ({i+1}/20)")
@@ -173,28 +187,45 @@ def wait_for_entry(api_key, market_id, side):
     return None, None, None
 
 def ensure_exit(api_key, market_id, side, known_shares):
-    print(f"\n⚡ VERIFYING EXIT: Closing {known_shares} {side.upper()} shares...")
-    execute_trade(api_key, market_id, side, shares=known_shares, action="sell")
+    print(f"\n⚡ PARANOID EXIT: Closing {known_shares} {side.upper()} shares...")
     
-    attempt = 1
+    # 1. IMMEDIATE BLIND SELL (Trust No One)
+    print(f"🔫 BLIND FIRE 1: Sending SELL for {known_shares} shares...")
+    execute_trade(api_key, market_id, side, shares=known_shares, action="sell")
+    time.sleep(1)
+    
+    # 2. LOOPED VERIFICATION with FORCED RETRIES
     zero_count = 0
-    while zero_count < 3:
+    attempt = 1
+    
+    # We must try at least 5 times OR see 3 confirms
+    while zero_count < 3 and attempt <= 10:
         positions = get_positions(api_key)
         my_pos = next((p for p in positions if str(p.get("market_id")) == str(market_id)), None)
         current_shares = float(my_pos.get(f"shares_{side}", 0)) if my_pos else 0
         
         if current_shares <= 0.001:
             zero_count += 1
-            print(f"✅ CONFIRMING EXIT: {zero_count}/3 (Wallet Empty)")
+            print(f"✅ WALLET SAYS EMPTY: {zero_count}/3")
+            # PARANOID: Even if empty, send another sell every other loop just in case
+            if zero_count < 3:
+                print(f"🔫 DOUBLE TAP: Sending backup SELL for {known_shares}...")
+                execute_trade(api_key, market_id, side, shares=known_shares, action="sell")
             time.sleep(2)
         else:
-            zero_count = 0 
-            print(f"⚠️  SHARES REMAIN: {current_shares}. Retrying SELL (Attempt {attempt})...")
+            zero_count = 0 # Reset count
+            print(f"⚠️ SHARES DETECTED: {current_shares}. FORCE SELLING (Attempt {attempt})...")
             execute_trade(api_key, market_id, side, shares=current_shares, action="sell")
             attempt += 1
-            time.sleep(3)
-            
-    print("🏁 TRADE CLOSED: Confirmed.")
+            time.sleep(2)
+
+    # 3. OVERKILL CLEANUP (Just to be absolutely sure)
+    print("🔥 OVERKILL PROTOCOL: Sending 2 final cleanup sells...")
+    execute_trade(api_key, market_id, side, shares=known_shares, action="sell")
+    time.sleep(1)
+    execute_trade(api_key, market_id, side, shares=known_shares, action="sell")
+    
+    print("🏁 TRADE CLOSED: Paranoid sequence complete.")
     record_close_time()
 
 def monitor_position(api_key, market_id, end_time, side, shares, entry, token_id):
@@ -202,25 +233,25 @@ def monitor_position(api_key, market_id, end_time, side, shares, entry, token_id
     print(f"📊 MONITORING: SL {STOP_LOSS_PCT*100}% | TP {TAKE_PROFIT_PCT*100}% | STAGNATION {STAGNATION_TIMEOUT}s")
     
     stop_triggered = False
-    
-    # Stagnation Tracking
     last_price = None
     stagnation_start_time = time.time()
     
     while now_utc() < target_time:
+        if os.environ.get("KILL_SWITCH") == "TRUE":
+            print("\n🚨 KILL SWITCH DETECTED! Exit...")
+            break 
+
         curr_price = get_clob_price(token_id)
         
         if curr_price is not None:
-            # --- STAGNATION LOGIC ---
             if curr_price == last_price:
                 elapsed = time.time() - stagnation_start_time
                 if elapsed >= STAGNATION_TIMEOUT:
-                    print(f"\n❄️ STAGNATION DETECTED: Price stuck at {curr_price:.3f} for {int(elapsed)}s. Exiting.")
-                    break # Trigger Exit
+                    print(f"\n❄️ STAGNATION: Price stuck {int(elapsed)}s. Exiting.")
+                    break 
             else:
                 last_price = curr_price
-                stagnation_start_time = time.time() # Reset timer on movement
-            # ------------------------
+                stagnation_start_time = time.time()
 
             pnl = (curr_price - entry) / entry
             print(f"⏱️ {side.upper()} | Price: {curr_price:.3f} | PnL: {pnl*100:+.1f}%")
@@ -241,12 +272,20 @@ def monitor_position(api_key, market_id, end_time, side, shares, entry, token_id
     ensure_exit(api_key, market_id, side, shares)
     
     if stop_triggered:
-        print("\n🚨 CIRCUIT BREAKER: Stop Loss hit. Shutting down bot.")
+        print("\n🚨 CIRCUIT BREAKER: Shutting down.")
         sys.exit(0)
 
 def run_once(live, quiet):
-    check_and_wait_cooldown()
     api_key = get_api_key()
+
+    if os.environ.get("KILL_SWITCH") == "TRUE":
+        mem = load_active_memory()
+        if mem:
+            print(f"🔥 STARTUP KILL: Selling {mem['shares']} {mem['side']}...")
+            ensure_exit(api_key, mem['market_id'], mem['side'], mem['shares'])
+        sys.exit(0)
+
+    check_and_wait_cooldown()
     
     now = now_utc()
     start_dt = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
@@ -280,12 +319,12 @@ def run_once(live, quiet):
     pf = get_portfolio(api_key)
     bal = float(pf.get("balance_usdc", 0) or 0)
     
-    # --- FIXED SIZING LOGIC ---
+    # --- SAFETY SIZING ---
     if bal < 5.0:
         amount = bal * 0.95
         print(f"⚠️ SURVIVAL MODE: Balance ${bal:.2f} < $5. Using ${amount:.2f}")
     else:
-        amount = MAX_POSITION_AMOUNT # HARD CAP
+        amount = MAX_POSITION_AMOUNT
         print(f"🛡️ HARD CAP: Wallet is ${bal:.2f}, but only betting ${amount:.2f}.")
         
     amount = float(f"{amount:.2f}")
