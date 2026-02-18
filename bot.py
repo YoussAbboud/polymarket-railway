@@ -30,7 +30,7 @@ from py_clob_client.headers.headers import (
 # ==============================================================================
 ASSET = "BTC"
 LOOKBACK_MINS = 12
-MIN_MOMENTUM_PCT = 0.08
+MIN_MOMENTUM_PCT = 0.12
 
 # --- SAFETY SETTINGS ---
 MAX_BET_SIZE = 5.0
