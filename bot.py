@@ -245,69 +245,48 @@ def place_order_live(client: ClobClient, token_id: str, limit_price: float, shar
 
 def monitor_trade(client, token_id, entry_price, end_time):
     """
-    Prints live PnL every 1s and AUTO-CLOSES when:
-      - TP hit
-      - SL hit
-      - buffer time hit (end_time - CLOSE_BUFFER_SECONDS)
-
-    Also CONFIRMS the SELL filled (via get_order). If not filled, cancels/reprices a few times.
-    Critically: will NOT trigger TP/SL until it can read a real price AND it detects you actually hold the token.
+    Clean monitor:
+    - Prints ONE line per second (price + PnL + seconds left).
+    - Never throws (so your outer loop won't treat it as "Trade Failed" and retry signatures).
+    - Auto-closes with a SELL when TP/SL hit OR buffer time reached.
+    - Avoids get_balance_allowance() entirely (your py_clob_client doesn't accept asset_type kwarg).
     """
 
-    from py_clob_client.order_builder.constants import SELL  # local import, no top-level edits
+    from py_clob_client.order_builder.constants import SELL
 
-    # --- knobs (only inside this function) ---
+    # --- local knobs ---
     PRINT_EVERY_S = 1
-    FILL_WAIT_S = 25                 # wait for position balance to appear
-    CLOSE_CONFIRM_TIMEOUT_S = 20     # wait for close order to fill
-    CLOSE_RETRIES = 3                # reprice attempts
+    CLOSE_CONFIRM_TIMEOUT_S = 20  # how long to wait for SELL to fill
+    BALANCE_WAIT_RETRIES = 20     # if SELL says "not enough balance", wait up to ~20s (1s each)
     EPS = 1e-6
 
-    entry_price = float(entry_price)
+    try:
+        entry_price = float(entry_price)
+    except Exception:
+        entry_price = 0.99
+
+    # close buffer time
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
 
-    def _call(method_names, *args, **kwargs):
-        for name in method_names:
-            fn = getattr(client, name, None)
-            if fn:
-                return fn(*args, **kwargs)
-        raise AttributeError(f"None of methods exist: {method_names}")
+    # estimate shares same way you sized BUY
+    try:
+        shares = round(MAX_BET_SIZE / entry_price, 1)
+    except Exception:
+        shares = round(MAX_BET_SIZE / 0.99, 1)
 
-    def _get_conditional_balance():
-        """
-        Best-effort: update + fetch conditional token balance for token_id.
-        Uses L2 methods: updateBalanceAllowance/getBalanceAllowance (python: snake_case usually).
-        """
-        params = {"asset_type": "CONDITIONAL", "token_id": token_id}
+    # tick size (best effort)
+    try:
+        tick_size = getattr(client, "get_tick_size", lambda _tid: "0.01")(token_id)
+    except Exception:
+        tick_size = "0.01"
+    try:
+        tick = float(tick_size or "0.01")
+    except Exception:
+        tick = 0.01
 
-        # update cached balance (best effort)
-        try:
-            _call(("update_balance_allowance", "updateBalanceAllowance"), params)
-        except Exception:
-            try:
-                _call(("update_balance_allowance", "updateBalanceAllowance"), **params)
-            except Exception:
-                pass
-
-        # get balance/allowance
-        try:
-            resp = _call(("get_balance_allowance", "getBalanceAllowance"), params)
-        except Exception:
-            resp = _call(("get_balance_allowance", "getBalanceAllowance"), **params)
-
-        if isinstance(resp, dict):
-            try:
-                return float(resp.get("balance") or 0.0)
-            except Exception:
-                return 0.0
-        return 0.0
-
-    def _get_price_mid():
-        """
-        Use midpoint; if missing, compute from orderbook bid/ask.
-        Returns None if still unavailable.
-        """
-        # 1) midpoint
+    def get_price_mid():
+        """Return a usable price or None. Never returns fake 0.5."""
+        # midpoint first
         try:
             mid = client.get_midpoint(token_id)
             if mid is not None:
@@ -315,7 +294,7 @@ def monitor_trade(client, token_id, entry_price, end_time):
         except Exception:
             pass
 
-        # 2) order book mid
+        # orderbook mid fallback
         try:
             book = client.get_order_book(token_id)
             bids = getattr(book, "bids", None) or []
@@ -333,52 +312,24 @@ def monitor_trade(client, token_id, entry_price, end_time):
 
         return None
 
-    def _best_bid():
+    def best_marketable_sell_price():
+        """Sell at best bid - 1 tick so it fills quickly."""
         try:
             book = client.get_order_book(token_id)
             bids = getattr(book, "bids", None) or []
             if bids:
-                return float(bids[0].price)
+                px = float(bids[0].price) - tick
+            else:
+                px = (get_price_mid() or entry_price) - tick
         except Exception:
-            pass
-        return None
+            px = entry_price - tick
 
-    def _wait_for_position_balance(deadline_dt):
-        """
-        Wait until conditional token balance > 0 (meaning you actually hold shares),
-        or until deadline/buffer time. Avoids 'not enough balance/allowance' when closing.
-        """
-        start = time.time()
-        while True:
-            now = datetime.now(timezone.utc)
-            if now >= deadline_dt:
-                return 0.0
-            bal = _get_conditional_balance()
-            if bal > EPS:
-                return bal
-            if time.time() - start > FILL_WAIT_S:
-                return 0.0
-            print(f"⏳ Waiting fill... conditional balance=0 | closes in {int((deadline_dt-now).total_seconds())}s", flush=True)
-            time.sleep(1)
+        px = max(0.01, min(px, 0.99))
+        return round(px, 2)
 
-    def _get_order(order_id):
-        try:
-            o = _call(("get_order", "getOrder"), order_id)
-            return o if isinstance(o, dict) else None
-        except Exception:
-            return None
-
-    def _parse_filled_status(o: dict):
-        status = (o.get("status") or o.get("state") or "").lower()
-        filled = o.get("size_filled") or o.get("filledSize") or o.get("filled_size") or 0.0
-        try:
-            filled = float(filled)
-        except Exception:
-            filled = 0.0
-        return filled, status
-
-    def _try_cancel(order_id):
-        for name in ("cancel_order", "cancelOrder", "cancel", "cancel_orders", "cancelOrders"):
+    def try_cancel(order_id):
+        """Best effort cancel (only if supported)."""
+        for name in ("cancel_order", "cancelOrder", "cancel"):
             fn = getattr(client, name, None)
             if fn:
                 try:
@@ -388,148 +339,155 @@ def monitor_trade(client, token_id, entry_price, end_time):
                     pass
         return False
 
-    def _post_close(size_to_sell, reason, aggression_ticks):
+    def get_order(order_id):
+        """Best effort order fetch."""
+        for name in ("get_order", "getOrder"):
+            fn = getattr(client, name, None)
+            if fn:
+                try:
+                    o = fn(order_id)
+                    return o if isinstance(o, dict) else None
+                except Exception:
+                    return None
+        return None
+
+    def order_is_filled(o, target_size):
+        """Parse different shapes safely."""
+        if not isinstance(o, dict):
+            return False
+        status = (o.get("status") or o.get("state") or "").lower()
+        filled = o.get("size_filled") or o.get("filledSize") or o.get("filled_size") or 0.0
+        try:
+            filled = float(filled)
+        except Exception:
+            filled = 0.0
+
+        if status == "filled":
+            return True
+        return filled >= (float(target_size) - 1e-3)
+
+    def close_position(reason):
         """
-        Posts a marketable SELL (limit) using best bid.
-        If no bid, uses current mid minus small amount.
-        """
-        # we keep it marketable: SELL price <= best bid
-        bid = _best_bid()
-        px = bid
-        if px is None:
-            mid = _get_price_mid()
-            if mid is None:
-                px = max(0.01, min(entry_price, 0.99))
-            else:
-                px = max(0.01, min(mid, 0.99))
-
-        # nudge slightly lower each retry to get filled faster
-        px = max(0.01, min(px - (0.01 * max(0, aggression_ticks - 1)), 0.99))
-        px = round(px, 2)
-
-        print(f"🧾 CLOSING ({reason}) -> SELL {size_to_sell:.4f} @ {px:.2f}", flush=True)
-
-        resp = client.create_and_post_order(
-            OrderArgs(price=float(px), size=float(size_to_sell), side=SELL, token_id=token_id)
-        )
-
-        oid = None
-        if isinstance(resp, dict):
-            oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
-
-        if oid:
-            print(f"✅ CLOSE ORDER SENT: {oid}", flush=True)
-        else:
-            print(f"✅ CLOSE ORDER SENT (resp): {resp}", flush=True)
-
-        return oid
-
-    def _close_and_confirm(reason):
-        """
-        Close whatever balance we currently have, confirm filled, retry if needed.
+        Place SELL and confirm fill.
+        Handles "not enough balance / allowance" by waiting for the BUY to actually settle.
         Never raises.
         """
-        for attempt in range(1, CLOSE_RETRIES + 1):
-            bal = _get_conditional_balance()
-            if bal <= EPS:
-                print("✅ Position balance is 0 — already closed.", flush=True)
-                return
+        print(f"🧾 CLOSE TRIGGER: {reason}", flush=True)
 
-            oid = None
+        # If we reach here extremely fast, the position might not be settled yet.
+        # We'll retry SELL if we get the 'not enough balance' error.
+        last_err = None
+        sell_order_id = None
+
+        for attempt in range(1, 4):  # a few reprices max
+            px = best_marketable_sell_price()
+            # be more aggressive on later attempts
+            if attempt > 1:
+                px = max(0.01, round(px - (tick * (attempt - 1)), 2))
+
+            # Wait-retry loop ONLY for "not enough balance"
+            for w in range(BALANCE_WAIT_RETRIES):
+                try:
+                    resp = client.create_and_post_order(
+                        OrderArgs(price=float(px), size=float(shares), side=SELL, token_id=token_id)
+                    )
+                    if isinstance(resp, dict):
+                        sell_order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+                    print(f"✅ CLOSE ORDER SENT: {sell_order_id or resp}", flush=True)
+                    last_err = None
+                    break
+                except Exception as e:
+                    msg = str(e).lower()
+                    last_err = e
+                    if "not enough balance" in msg or "allowance" in msg:
+                        # BUY not settled yet; wait 1s and try again (no spam, just 1 line)
+                        print("⏳ Waiting settlement (no balance yet)...", flush=True)
+                        time.sleep(1)
+                        continue
+                    else:
+                        # real error, break out
+                        break
+
+            if last_err is None:
+                break
+
+        if last_err is not None:
+            print(f"⚠️ Could not close automatically: {last_err}", flush=True)
+            return
+
+        # Confirm fill if we have an order id and get_order is supported
+        if not sell_order_id:
+            return
+
+        deadline = time.time() + CLOSE_CONFIRM_TIMEOUT_S
+        while time.time() < deadline:
+            o = get_order(sell_order_id)
+            if o and order_is_filled(o, shares):
+                print("✅ CLOSE FILLED.", flush=True)
+                return
+            time.sleep(1)
+
+        # Not filled: try cancel; if canceled we can place a more aggressive close
+        if try_cancel(sell_order_id):
+            print("🧹 Close not filled in time — canceled, posting more aggressively...", flush=True)
             try:
-                oid = _post_close(bal, reason if attempt == 1 else f"{reason} (retry {attempt})", aggression_ticks=attempt)
+                px = max(0.01, round(best_marketable_sell_price() - (2 * tick), 2))
+                resp = client.create_and_post_order(
+                    OrderArgs(price=float(px), size=float(shares), side=SELL, token_id=token_id)
+                )
+                oid2 = resp.get("orderID") if isinstance(resp, dict) else None
+                print(f"✅ CLOSE ORDER SENT (retry): {oid2 or resp}", flush=True)
             except Exception as e:
-                print(f"❌ Close post failed (attempt {attempt}): {e}", flush=True)
-                time.sleep(1)
-                continue
-
-            # confirm fill by order status if we have id, else by balance dropping
-            deadline = time.time() + CLOSE_CONFIRM_TIMEOUT_S
-            last_bal = bal
-
-            while time.time() < deadline:
-                # If order id exists, prefer order status
-                if oid:
-                    o = _get_order(oid)
-                    if o:
-                        filled, status = _parse_filled_status(o)
-                        if status == "filled" or filled >= bal - 1e-6:
-                            print(f"✅ Close filled (status={status}, filled={filled:.4f}).", flush=True)
-                            return
-
-                # fallback: check balance drop
-                new_bal = _get_conditional_balance()
-                if new_bal <= EPS:
-                    print("✅ Balance now 0 — closed.", flush=True)
-                    return
-                if new_bal < last_bal - EPS:
-                    last_bal = new_bal
-
-                time.sleep(1)
-
-            # not filled in time: try cancel then retry
-            if oid and _try_cancel(oid):
-                print(f"🧹 Close not filled in time — canceled {oid}. Retrying...", flush=True)
-            else:
-                print("⚠️ Close not confirmed filled and couldn't cancel. Stopping to avoid duplicate sells.", flush=True)
-                return
-
-        print("⚠️ Close retries exhausted. Check position on Polymarket.", flush=True)
-
-    # ---------------------------
-    # Main monitoring loop
-    # ---------------------------
-    print("📊 MONITORING... (AUTO-CLOSE + CONFIRM-FILL enabled)", flush=True)
-
-    # Wait until we actually have a filled position (conditional balance > 0),
-    # otherwise we might trigger SL/TP on fake price and/or fail closing.
-    pos_bal = _wait_for_position_balance(target_time)
-    if pos_bal <= EPS:
-        # Either not filled yet or couldn't fetch balance before buffer
-        if datetime.now(timezone.utc) >= target_time:
-            print("⏰ Buffer reached but no filled position detected. Check open orders on the site.", flush=True)
+                print(f"⚠️ Close retry failed: {e}", flush=True)
         else:
-            print("⚠️ Could not detect filled position (balance still 0). Check the site for fills/open orders.", flush=True)
+            print("⚠️ Close not filled and couldn't cancel. Check position on the website.", flush=True)
+
+    # ---------------- Main monitor loop ----------------
+    print("📊 MONITORING... (PnL 1s + AUTO-CLOSE)", flush=True)
+
+    # If we are already in the buffer window, close immediately
+    if datetime.now(timezone.utc) >= target_time:
+        close_position("BUFFER (immediate)")
         return
 
-    # live PnL prints every 1s
     while True:
-        now = datetime.now(timezone.utc)
-        if now >= target_time:
-            _close_and_confirm("BUFFER")
-            break
+        try:
+            now = datetime.now(timezone.utc)
 
-        price = _get_price_mid()
-        bal = _get_conditional_balance()
+            # buffer reached => close
+            if now >= target_time:
+                close_position("BUFFER")
+                break
 
-        # If price unavailable, do NOT act on TP/SL
-        if price is None:
-            print(f"⏱️ Price: N/A | holding={bal:.4f} | closes in {int((target_time-now).total_seconds())}s", flush=True)
+            price = get_price_mid()
+            secs_left = int((target_time - now).total_seconds())
+
+            if price is None:
+                # print ONE line, do not compute fake pnl
+                print(f"⏱️ Price: N/A | PnL: N/A | closes in {secs_left}s", flush=True)
+                time.sleep(PRINT_EVERY_S)
+                continue
+
+            pnl = (price - entry_price) / entry_price
+
+            # ONE clean line per second
+            print(f"⏱️ Price: {price:.3f} | PnL: {pnl*100:+.2f}% | closes in {secs_left}s", flush=True)
+
+            if pnl <= -STOP_LOSS_PCT:
+                close_position("STOP LOSS")
+                break
+            if pnl >= TAKE_PROFIT_PCT:
+                close_position("TAKE PROFIT")
+                break
+
+            time.sleep(PRINT_EVERY_S)
+
+        except Exception as e:
+            # CRITICAL: never throw from monitor (prevents signature retries & "trade failed" spam)
+            print(f"⚠️ Monitor error (ignored): {e}", flush=True)
             time.sleep(1)
-            continue
-
-        pnl = (float(price) - entry_price) / entry_price
-        secs_left = int((target_time - now).total_seconds())
-
-        print(f"⏱️ Price: {price:.3f} | PnL: {pnl*100:+.2f}% | holding={bal:.4f} | closes in {secs_left}s", flush=True)
-
-        # If balance dropped to ~0, we’re closed (manual or prior close filled)
-        if bal <= EPS:
-            print("✅ Position balance is 0 — closed.", flush=True)
-            break
-
-        if pnl <= -STOP_LOSS_PCT:
-            _close_and_confirm("STOP LOSS")
-            break
-
-        if pnl >= TAKE_PROFIT_PCT:
-            _close_and_confirm("TAKE PROFIT")
-            break
-
-        time.sleep(PRINT_EVERY_S)
 
     print("✅ MONITOR COMPLETE.", flush=True)
-
 
 
 def run_strategy(live: bool):
