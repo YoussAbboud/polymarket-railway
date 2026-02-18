@@ -273,45 +273,125 @@ def cancel_order_safe(client: ClobClient, order_id: str):
 # =========================
 # MONITOR + AUTO-CLOSE (real filled size)
 # =========================
-def monitor_and_autoclose(client: ClobClient, slug: str, token_id: str, buy_order_id: str, end_time: datetime, fallback_entry: float):
+def monitor_and_autoclose(client, slug, token_id, buy_order_id, end_time, fallback_entry: float):
     """
-    - Waits for BUY to fill -> gets REAL filled size + avg fill price
-    - Prints exactly 1 line/sec
-    - Auto closes TP/SL/buffer using filled size
-    - Retries close until settlement is ready
-    - NEVER raises (prevents Railway restart cascades)
+    Fixes:
+    - Heartbeat prints while waiting for BUY fill (so it never looks frozen).
+    - Detects fill via BOTH order status AND conditional token balance.
+    - Uses CURRENT conditional balance for SELL size (prevents 'not enough balance/allowance').
+    - Prints exactly 1 line/sec in monitor phase.
+    - Never raises.
     """
     try:
         target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
         log("📊 MONITORING... (PnL 1s + AUTO-CLOSE)")
 
-        # 1) wait for buy fill (or cancel before buffer)
-        filled_size = 0.0
+        # ---- helpers ----
+        def _get_order():
+            return get_order_safe(client, buy_order_id)
+
+        def _parse_order(o):
+            if not isinstance(o, dict):
+                return ("unknown", 0.0, None)
+            st, filled, avg = parse_filled_avg(o)
+            return (st or "unknown", float(filled or 0.0), avg)
+
+        def _get_conditional_balance() -> float:
+            # IMPORTANT: your client wants a SINGLE dict arg, not kwargs
+            params = {"asset_type": "CONDITIONAL", "token_id": str(token_id)}
+
+            # refresh (best effort)
+            for nm in ("update_balance_allowance", "updateBalanceAllowance"):
+                fn = getattr(client, nm, None)
+                if fn:
+                    try:
+                        fn(params)
+                    except Exception:
+                        pass
+
+            for nm in ("get_balance_allowance", "getBalanceAllowance"):
+                fn = getattr(client, nm, None)
+                if fn:
+                    try:
+                        r = fn(params)
+                        if isinstance(r, dict):
+                            return float(r.get("balance") or 0.0)
+                    except Exception:
+                        pass
+            return 0.0
+
+        def _best_bid_ask():
+            return best_bid_ask(client, token_id)
+
+        def _mark_price():
+            return mark_price(client, token_id)
+
+        def _round_size(x: float) -> float:
+            # keep it safe: 0.1 precision like your BUY sizing
+            try:
+                return max(0.0, round(float(x), 1))
+            except Exception:
+                return 0.0
+
+        # ---- 1) wait for fill (with heartbeat) ----
         entry = float(fallback_entry)
+        filled_size = 0.0
+
+        # hard max wait for fill; after that we cancel the BUY (best effort) and exit
+        FILL_MAX_WAIT_S = 25
+        fill_deadline = time.time() + FILL_MAX_WAIT_S
 
         while now_utc() < target_time:
-            o = get_order_safe(client, buy_order_id)
-            if o:
-                st, filled, avg = parse_filled_avg(o)
-                if filled > 0:
-                    filled_size = filled
-                    if avg is not None:
-                        entry = float(avg)
-                    log(f"✅ BUY FILLED: {filled_size:.4f} @ {entry:.3f} (status={st})")
-                    break
+            o = _get_order()
+            st, filled, avg = _parse_order(o)
+            if avg is not None:
+                entry = float(avg)
+
+            bal = _get_conditional_balance()
+
+            # If either reports a position, treat as filled.
+            if filled > 0:
+                filled_size = filled
+                log(f"✅ BUY FILLED (order): {filled_size:.4f} @ {entry:.3f} (status={st})")
+                break
+            if bal > 0:
+                filled_size = bal
+                log(f"✅ BUY FILLED (balance): {filled_size:.4f} @ {entry:.3f} (status={st})")
+                break
+
+            bid, ask = _best_bid_ask()
+            secs_left = max(0, int((target_time - now_utc()).total_seconds()))
+            log(
+                f"⏳ Waiting fill... status={st} filled={filled:.4f} bal={bal:.4f} "
+                f"| bid={bid if bid is not None else 'N/A'} ask={ask if ask is not None else 'N/A'} "
+                f"| closes in {secs_left}s",
+            )
+
+            if time.time() >= fill_deadline:
+                cancel_order_safe(client, buy_order_id)
+                log("⚠️ BUY did not fill fast enough. Canceled (best effort) and exiting to avoid ghost positions.")
+                return False
+
             time.sleep(1)
 
         if filled_size <= 0:
+            # buffer hit and still no balance
             cancel_order_safe(client, buy_order_id)
-            log("⚠️ Buy not filled before buffer. Cancelled (best effort).")
+            log("⚠️ No filled position detected before buffer. Canceled buy (best effort).")
             return False
 
-        # 2) close helper (reprice + wait settlement)
+        # ---- 2) close helper (uses CURRENT balance, not stale filled_size) ----
         def place_close(reason: str) -> bool:
-            for attempt in range(1, 10):
-                bid, _ = best_bid_ask(client, token_id)
+            for attempt in range(1, 12):
+                bal = _get_conditional_balance()
+                size = _round_size(bal)
 
-                # marketable sell: <= best bid
+                if size <= 0:
+                    log("✅ No conditional balance -> position already closed.")
+                    return True
+
+                bid, _ = _best_bid_ask()
+                # marketable sell: <= best bid; if bid missing, go low to get filled
                 if bid is None:
                     px = 0.01
                 else:
@@ -320,34 +400,30 @@ def monitor_and_autoclose(client: ClobClient, slug: str, token_id: str, buy_orde
                 px = max(0.01, min(px, 0.99))
                 px = round(px, 2)
 
-                size = max(0.0, round(filled_size, 4))
-                log(f"🧾 CLOSING ({reason}) -> SELL {size:.4f} @ {px:.2f} (attempt {attempt})")
-
                 try:
-                    resp = client.create_and_post_order(OrderArgs(price=float(px), size=float(size), side=SELL, token_id=token_id))
+                    log(f"🧾 CLOSING ({reason}) -> SELL {size:.1f} @ {px:.2f} (attempt {attempt})")
+                    resp = client.create_and_post_order(
+                        OrderArgs(price=float(px), size=float(size), side=SELL, token_id=token_id)
+                    )
                     sell_id = resp.get("orderID") if isinstance(resp, dict) else None
                     log(f"✅ CLOSE ORDER SENT: {sell_id or resp}")
 
-                    # confirm fill (best effort)
-                    if sell_id:
-                        deadline = time.time() + 25
-                        while time.time() < deadline:
-                            oo = get_order_safe(client, sell_id)
-                            if oo:
-                                st, f, _ = parse_filled_avg(oo)
-                                if st == "filled" or f >= size - 1e-6:
-                                    log("✅ CLOSE FILLED.")
-                                    return True
-                            time.sleep(1)
+                    # confirm fill OR balance drops to ~0
+                    deadline = time.time() + 25
+                    while time.time() < deadline:
+                        bal2 = _get_conditional_balance()
+                        if bal2 <= 1e-9:
+                            log("✅ Balance is now ~0 (closed).")
+                            return True
+                        time.sleep(1)
 
-                        # not filled -> cancel and retry more aggressive
+                    # not confirmed -> cancel and retry more aggressive
+                    if sell_id:
                         cancel_order_safe(client, sell_id)
 
-                    # even without confirmation, retry loop continues
                 except Exception as e:
                     msg = str(e).lower()
                     if "not enough balance" in msg or "allowance" in msg:
-                        # settlement not ready yet
                         time.sleep(1)
                         continue
                     log(f"⚠️ Close failed: {e}")
@@ -356,12 +432,12 @@ def monitor_and_autoclose(client: ClobClient, slug: str, token_id: str, buy_orde
             log("⚠️ Could not confirm close after retries.")
             return False
 
-        # 3) main monitor loop
+        # ---- 3) monitor loop (1 line/sec) ----
         while True:
             now_dt = now_utc()
             secs_left = max(0, int((target_time - now_dt).total_seconds()))
 
-            mp = mark_price(client, token_id)
+            mp = _mark_price()
             if mp is None:
                 log(f"⏱️ Price: N/A | PnL: N/A | closes in {secs_left}s")
             else:
@@ -370,7 +446,6 @@ def monitor_and_autoclose(client: ClobClient, slug: str, token_id: str, buy_orde
 
                 if pnl <= -STOP_LOSS_PCT:
                     return place_close("STOP LOSS")
-
                 if pnl >= TAKE_PROFIT_PCT:
                     return place_close("TAKE PROFIT")
 
