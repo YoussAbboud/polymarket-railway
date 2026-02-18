@@ -244,31 +244,240 @@ def place_order_live(client: ClobClient, token_id: str, limit_price: float, shar
     return post_order_fixed_poly_address(client, signed_order, order_type="GTC", post_only=False)
 
 def monitor_trade(client, token_id, entry_price, end_time):
-    print("📊 MONITORING... (Manual Sell available on Polymarket website)")
-    last_price, stagnation_start = None, time.time()
+    """
+    Live PnL every 1s + AUTO-CLOSE (SELL) on:
+    - TP hit
+    - SL hit
+    - buffer time reached (end_time - CLOSE_BUFFER_SECONDS)
+
+    Extra safety:
+    - confirms the SELL is filled
+    - if not filled: tries cancel + repost more aggressively (for remaining size)
+    """
+    from py_clob_client.order_builder.constants import SELL  # local import
+
+    print("📊 MONITORING... (AUTO-CLOSE + CONFIRM-FILL enabled)", flush=True)
+
+    # --- tuning knobs (only inside monitoring) ---
+    PRINT_EVERY_S = 1
+    CONFIRM_POLL_S = 1
+    CLOSE_CONFIRM_TIMEOUT_S = 20      # seconds to wait for a close order to fill
+    CLOSE_RETRIES = 3                 # how many reprice attempts
+    EPS = 1e-6
+
+    # Buffer close time
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
 
-    while datetime.now(timezone.utc) < target_time:
+    # Shares (mirror how you sized the BUY in your strategy)
+    try:
+        entry_price = float(entry_price)
+        shares = round(MAX_BET_SIZE / entry_price, 1)
+    except Exception:
+        shares = round(MAX_BET_SIZE / 0.99, 1)
+
+    # Need these for correct signing/options on the SELL
+    try:
+        _, tick_size, neg_risk = get_book_params(client, token_id)
+    except Exception:
+        tick_size, neg_risk = "0.01", False
+
+    try:
+        tick = float(tick_size or "0.01")
+    except Exception:
+        tick = 0.01
+
+    opts = PartialCreateOrderOptions(tick_size=str(tick_size or "0.01"), neg_risk=bool(neg_risk))
+
+    def _get_order(order_id: str):
+        """Best-effort fetch order details."""
+        if hasattr(client, "get_order"):
+            try:
+                o = client.get_order(order_id)
+                return o if isinstance(o, dict) else None
+            except Exception:
+                return None
+        return None
+
+    def _parse_filled_and_status(o: dict):
+        """Extract filled size + status from varying response shapes."""
+        status = (o.get("status") or o.get("state") or "").lower()
+
+        filled = (
+            o.get("size_filled")
+            or o.get("filledSize")
+            or o.get("filled_size")
+            or o.get("filled")
+            or 0.0
+        )
+        try:
+            filled = float(filled)
+        except Exception:
+            filled = 0.0
+
+        return filled, status
+
+    def _try_cancel(order_id: str) -> bool:
+        """Try to cancel an order if the client supports it."""
+        for fn in ("cancel_order", "cancel", "cancel_orders"):
+            if hasattr(client, fn):
+                try:
+                    getattr(client, fn)(order_id)
+                    return True
+                except Exception:
+                    pass
+        return False
+
+    def _best_marketable_sell_price(aggression_ticks: int = 1) -> float:
+        """
+        Choose a sell price that should fill quickly:
+        - prefer best bid - N ticks
+        - fallback to midpoint - N ticks
+        """
+        try:
+            book = client.get_order_book(token_id)
+            if book and getattr(book, "bids", None) and len(book.bids) > 0:
+                best_bid = float(book.bids[0].price)
+                px = best_bid - (tick * aggression_ticks)
+            else:
+                mid = client.get_midpoint(token_id)
+                px = (float(mid) if mid else entry_price) - (tick * aggression_ticks)
+        except Exception:
+            px = entry_price - (tick * aggression_ticks)
+
+        px = max(0.01, min(px, 0.99))
+        return round(px, 2)
+
+    def _post_sell(size_to_sell: float, aggression_ticks: int, reason: str):
+        """Create + post a SELL order using your existing signing pipeline."""
+        px = _best_marketable_sell_price(aggression_ticks=aggression_ticks)
+        print(f"🧾 CLOSING ({reason}) -> SELL {size_to_sell} @ {px:.2f}", flush=True)
+
+        order_args = OrderArgs(
+            price=float(px),
+            size=float(size_to_sell),
+            side=SELL,
+            token_id=token_id,
+        )
+        signed_order = client.create_order(order_args, opts)
+        resp = post_order_fixed_poly_address(client, signed_order, order_type="GTC", post_only=False)
+
+        oid = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+        if not oid:
+            raise Exception(f"Close order response missing id: {resp}")
+        print(f"✅ CLOSE ORDER SENT: {oid}", flush=True)
+        return oid
+
+    def close_position_and_confirm(reason: str):
+        """
+        Close and confirm fill; if not filled, cancel+repost more aggressively
+        for the REMAINING size.
+        """
+        remaining = float(shares)
+
+        for attempt in range(1, CLOSE_RETRIES + 1):
+            if remaining <= EPS:
+                print("✅ Position fully closed.", flush=True)
+                return
+
+            # more aggressive each retry: 1 tick, 2 ticks, 3 ticks...
+            aggression = attempt
+
+            oid = _post_sell(remaining, aggression_ticks=aggression, reason=reason if attempt == 1 else f"{reason} (retry {attempt})")
+
+            # confirm fill
+            deadline = time.time() + CLOSE_CONFIRM_TIMEOUT_S
+            last_filled = 0.0
+
+            while time.time() < deadline:
+                o = _get_order(oid)
+                if o:
+                    filled, status = _parse_filled_and_status(o)
+                    # keep in bounds
+                    filled = max(0.0, min(filled, remaining))
+                    if filled > last_filled + EPS:
+                        last_filled = filled
+
+                    # done if filled or remaining filled
+                    if status == "filled" or (remaining - filled) <= EPS:
+                        remaining -= filled
+                        print(f"✅ Close filled (status={status}). Remaining={remaining:.4f}", flush=True)
+                        if remaining <= EPS:
+                            print("✅ Position fully closed.", flush=True)
+                            return
+                        break
+
+                time.sleep(CONFIRM_POLL_S)
+
+            # If not filled after timeout: try cancel before retry
+            # Also reduce remaining by whatever filled so far
+            remaining = max(0.0, remaining - last_filled)
+
+            if remaining <= EPS:
+                print("✅ Position fully closed.", flush=True)
+                return
+
+            canceled = _try_cancel(oid)
+            if canceled:
+                print(f"🧹 Close order not filled in time; canceled {oid}. Retrying more aggressively...", flush=True)
+            else:
+                print(
+                    f"⚠️ Close order not filled in time and could not cancel {oid}. "
+                    "To avoid double-selling, not reposting further.",
+                    flush=True
+                )
+                return
+
+        print("⚠️ Close retries exhausted. Please check position on Polymarket.", flush=True)
+
+    # If already inside buffer time, close immediately
+    if datetime.now(timezone.utc) >= target_time:
+        close_position_and_confirm("BUFFER (immediate)")
+        return
+
+    # Live loop: print every 1 second
+    last_mid = None
+    stagnation_start = time.time()
+
+    while True:
+        now = datetime.now(timezone.utc)
+
+        if now >= target_time:
+            close_position_and_confirm("BUFFER")
+            break
+
         try:
             mid = client.get_midpoint(token_id)
             curr = float(mid) if mid else 0.5
-
-            if curr == last_price:
-                if time.time() - stagnation_start >= STAGNATION_TIMEOUT:
-                    print("\n❄️ STAGNATION. Exit.")
-                    break
-            else:
-                last_price, stagnation_start = curr, time.time()
-
-            pnl = (curr - entry_price) / entry_price
-            print(f"⏱️ Price: {curr:.3f} | PnL: {pnl*100:+.1f}%")
-            if pnl <= -STOP_LOSS_PCT or pnl >= TAKE_PROFIT_PCT:
-                break
         except Exception:
-            pass
-        time.sleep(2)
+            curr = 0.5
 
-    print("⏰ MONITOR COMPLETE. Please check your position on the website.")
+        # stagnation guard (kept, but now we still close at buffer anyway)
+        if curr == last_mid:
+            if time.time() - stagnation_start >= STAGNATION_TIMEOUT:
+                print("❄️ STAGNATION detected. Will close at buffer (or TP/SL if hit).", flush=True)
+        else:
+            last_mid = curr
+            stagnation_start = time.time()
+
+        pnl = (curr - entry_price) / entry_price
+        seconds_left = int((target_time - now).total_seconds())
+
+        print(
+            f"⏱️ Price: {curr:.3f} | PnL: {pnl*100:+.2f}% | closes in {seconds_left}s",
+            flush=True
+        )
+
+        if pnl <= -STOP_LOSS_PCT:
+            close_position_and_confirm("STOP LOSS")
+            break
+        if pnl >= TAKE_PROFIT_PCT:
+            close_position_and_confirm("TAKE PROFIT")
+            break
+
+        time.sleep(PRINT_EVERY_S)
+
+    print("✅ MONITOR COMPLETE.", flush=True)
+
 
 def run_strategy(live: bool):
     pk = get_env("PRIVATE_KEY")
