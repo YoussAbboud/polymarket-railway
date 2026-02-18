@@ -26,8 +26,8 @@ SMART_SIZING_PCT = 0.95
 
 STOP_LOSS_PCT = 0.15         
 TAKE_PROFIT_PCT = 0.20       
-CLOSE_BUFFER_SECONDS = 80    
-COOLDOWN_SECONDS = 60        
+CLOSE_BUFFER_SECONDS = 90    
+COOLDOWN_SECONDS = 30        
 # ==============================================================================
 
 # -----------------------
