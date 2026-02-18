@@ -1,1 +1,3 @@
-# stdlib-only (no deps)
+py-clob-client
+requests
+python-dotenv
