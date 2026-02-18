@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-Railway-ready Polymarket BTC 5m Bot (v11.2)
+Railway-ready Polymarket BTC 5m Bot (v11.3)
 
-✅ Strategy unchanged: 12m momentum signal, $5 max bet, BTC 5m up/down markets
-✅ Proxy/Safe wallet compatible (Magic Link / Proxy wallets)
-✅ Order posting workaround (manual POST /order) with correct POLY_ADDRESS + owner
-✅ Fixes "order owner has to be the owner of the API KEY"
-✅ Monitoring auto-closes position (TP/SL or close buffer) with SELL order
+Fixes:
+- ✅ Avoids minified JSON (some CLOB endpoints reject {"a":"b"} but accept {"a": "b"}) :contentReference[oaicite:3]{index=3}
+- ✅ Adds small timestamp drift buffer (-5s) to reduce intermittent 401s :contentReference[oaicite:4]{index=4}
+- ✅ owner + POLY_ADDRESS always match API key owner (proxy wallet) :contentReference[oaicite:5]{index=5}
+- ✅ Monitoring auto-closes TP/SL or close buffer
 
 REQUIRED ENV:
 - PRIVATE_KEY
-- POLYGON_ADDRESS     (FUNDER / proxy wallet shown on Polymarket)
+- POLYGON_ADDRESS   (FUNDER / proxy wallet shown on Polymarket)
 
 OPTIONAL ENV:
-- SIGNATURE_TYPE      (force: 2 or 1). If not set: tries [2, 1]
-  IMPORTANT: do NOT use 0 in proxy setups (causes API key owner mismatch)
+- SIGNATURE_TYPE    (force 2 or 1). If not set: tries [2, 1]
 """
 
 import os, sys, json, time, argparse, requests
@@ -38,9 +37,9 @@ LOOKBACK_MINS = 12
 MIN_MOMENTUM_PCT = 0.08
 
 # --- SAFETY SETTINGS ---
-MAX_BET_SIZE = 7.0
-STOP_LOSS_PCT = 0.10
-TAKE_PROFIT_PCT = 0.15
+MAX_BET_SIZE = 5.0
+STOP_LOSS_PCT = 0.15
+TAKE_PROFIT_PCT = 0.20
 CLOSE_BUFFER_SECONDS = 60
 STAGNATION_TIMEOUT = 20
 # ==============================================================================
@@ -91,9 +90,6 @@ def parse_slug_end_time(slug: str) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(minutes=5)
 
 def to_primitive(x: Any) -> Any:
-    """
-    Convert SignedOrder / pydantic / dataclasses / objects into JSON-serializable primitives.
-    """
     if x is None:
         return None
     if isinstance(x, (str, int, float, bool)):
@@ -103,15 +99,13 @@ def to_primitive(x: Any) -> Any:
     if isinstance(x, dict):
         return {str(k): to_primitive(v) for k, v in x.items()}
 
-    # pydantic v2
-    if hasattr(x, "model_dump") and callable(getattr(x, "model_dump")):
+    if hasattr(x, "model_dump") and callable(getattr(x, "model_dump")):  # pydantic v2
         try:
             return to_primitive(x.model_dump())
         except Exception:
             pass
 
-    # pydantic v1
-    if hasattr(x, "dict") and callable(getattr(x, "dict")):
+    if hasattr(x, "dict") and callable(getattr(x, "dict")):  # pydantic v1
         try:
             return to_primitive(x.dict())
         except Exception:
@@ -160,14 +154,6 @@ def init_client(signature_type: int, pk: str, funder: str) -> ClobClient:
 # Manual POST /order (proxy-safe)
 # ==============================================================================
 def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="GTC", post_only=False):
-    """
-    Manual POST /order using correct L2 HMAC headers and POLY_ADDRESS.
-
-    CRITICAL:
-    - The `owner` in the request body MUST match the owner of the API key.
-    - For proxy/safe wallets (signature_type 1/2): owner must be the FUNDER (proxy wallet).
-    - For this bot we ONLY use signature_type 2/1 (proxy wallet), so owner = funder.
-    """
     if build_hmac_signature is None:
         raise RuntimeError(
             "build_hmac_signature not available from py_clob_client. "
@@ -183,8 +169,7 @@ def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="
     if not funder:
         raise RuntimeError("Missing funder on client.")
 
-    # owner/poly address must match API key owner
-    # For proxy/safe wallets (1/2): this is the funder
+    # Proxy/Safe: owner must be funder; (we only use 1/2 here)
     owner_addr = funder if sig_type in (1, 2) else client.signer.address()
 
     # Build body and enforce owner
@@ -203,9 +188,11 @@ def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="
         }
         body = to_primitive(body)
 
-    serialized = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    # ✅ IMPORTANT FIX: DO NOT minify JSON; keep default spacing
+    serialized = json.dumps(body, ensure_ascii=False)
 
-    ts = int(time.time())
+    # ✅ IMPORTANT FIX: small drift buffer
+    ts = int(time.time()) - 5
     request_path = "/order"
     hmac_sig = build_hmac_signature(
         creds.api_secret,
@@ -217,7 +204,7 @@ def post_order_fixed_poly_address(client: ClobClient, signed_order, order_type="
 
     headers = {
         "Content-Type": "application/json",
-        H_POLY_ADDRESS: owner_addr,          # ✅ MUST match API key owner
+        H_POLY_ADDRESS: owner_addr,
         H_POLY_SIGNATURE: hmac_sig,
         H_POLY_TIMESTAMP: str(ts),
         H_POLY_API_KEY: creds.api_key,
@@ -496,20 +483,15 @@ def run_strategy(live: bool):
         log("🟡 Not live mode (--live not set). Exiting without placing order.")
         return
 
-    # ✅ Proxy-only signature types (avoid 0 which breaks API key owner)
+    # Proxy-only signature types (avoid 0 in proxy setups)
     sig_env = os.getenv("SIGNATURE_TYPE", "").strip()
     if sig_env.isdigit():
         forced = int(sig_env)
-        if forced not in (1, 2):
-            log("⚠️ SIGNATURE_TYPE must be 1 or 2 for proxy wallets. Using default [2,1].")
-            sig_candidates = [2, 1]
-        else:
-            sig_candidates = [forced]
+        sig_candidates = [forced] if forced in (1, 2) else [2, 1]
     else:
         sig_candidates = [2, 1]
 
     last_err = None
-
     for sig_type in sig_candidates:
         try:
             client = init_client(sig_type, pk, funder)
