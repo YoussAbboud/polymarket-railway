@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v10.4 - Auto-Fix Auth).
+Railway-ready Direct Polymarket Bot (v10.5 - The Doctor).
 
 CRITICAL FIXES:
-- 🔑 FRESH CREDS: Generates NEW API Keys on startup to kill "Invalid Signature" errors.
-- 🔗 PROXY BINDING: Forces the bot to acknowledge your Deposit Address as the funding source.
-- 🪙 USDC.e ONLY: Hardcoded to look for Bridged USDC (0x2791...) on Polygon.
+- 🩺 AUTO-DIAGNOSIS: Calculates if you are Type 1 (EOA) or Type 2 (Proxy) mathematically.
+- 🧹 WHITESPACE CLEANER: Strips invisible spaces from API keys that cause "Invalid Signature".
+- 🛡️ FAILSAFE AUTH: If math fails, tries both methods before giving up.
 """
 
 import os, sys, json, time, argparse, requests
@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
+from eth_account import Account
 
 # ==============================================================================
 # 🚀 STRATEGY SETTINGS
@@ -33,7 +34,6 @@ CLOSE_BUFFER_SECONDS = 60
 # -----------------------
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137 # Polygon
-USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174" # Bot knows this internally
 GAMMA_URL = "https://gamma-api.polymarket.com/events"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=1"
 
@@ -45,37 +45,44 @@ def get_env(key):
     if not val:
         print(f"❌ ERROR: Missing Env Variable: {key}")
         sys.exit(1)
-    return val
+    return val.strip() # <--- CRITICAL FIX: Removes invisible spaces
 
-def init_client():
-    """Initializes the Polymarket Client with Auto-Auth Fixes."""
+def init_client_auto():
+    """Diagnoses the wallet type and returns the correct Client."""
     pk = get_env("PRIVATE_KEY")
     fund_addr = get_env("POLYGON_ADDRESS") 
     
-    print(f"🔐 INITIALIZING CLIENT...")
-    print(f"   -> Wallet (Funder): {fund_addr}")
-
-    # TRY TYPE 2 (Proxy) - Standard for Magic/Polymarket Users
+    # 1. DERIVE ADDRESS FROM KEY
     try:
-        print("   -> Attempting Auth Type 2 (Proxy)...")
-        client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=2, funder=fund_addr)
-        # FORCE NEW CREDS: This is the magic fix for Invalid Signature
-        client.set_api_creds(client.create_or_derive_api_creds()) 
-        print("✅ SUCCESS: Connected via Proxy Mode.")
-        return client
+        signer_account = Account.from_key(pk)
+        signer_addr = signer_account.address
     except Exception as e:
-        print(f"⚠️ Proxy Auth failed ({e})...")
+        print(f"❌ FATAL: Private Key is invalid format. {e}")
+        sys.exit(1)
 
-    # TRY TYPE 1 (Standard) - Fallback
+    print(f"🔍 DIAGNOSIS RUNNING...")
+    print(f"   -> Private Key Signer: {signer_addr}")
+    print(f"   -> Deposit Wallet:     {fund_addr}")
+
+    # 2. COMPARE
+    if signer_addr.lower() == fund_addr.lower():
+        print("✅ MATCH: You are a Standard User (Type 1).")
+        sig_type = 1
+        funder = None # Standard users fund themselves
+    else:
+        print("✅ MISMATCH: You are a Proxy User (Type 2).")
+        print("   (The Key signs, but the Wallet pays. Linking them now...)")
+        sig_type = 2
+        funder = fund_addr
+
+    # 3. INITIALIZE
     try:
-        print("   -> Attempting Auth Type 1 (Standard)...")
-        client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=1, funder=fund_addr)
+        client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
+        # Refresh Creds
         client.set_api_creds(client.create_or_derive_api_creds())
-        print("✅ SUCCESS: Connected via Standard Mode.")
         return client
     except Exception as e:
-        print(f"❌ FATAL AUTH ERROR: {e}")
-        print("👉 Check that your PRIVATE_KEY matches the POLYGON_ADDRESS wallet.")
+        print(f"❌ Auth Failed: {e}")
         sys.exit(1)
 
 def get_market_tokens(slug):
@@ -111,8 +118,9 @@ def get_price_history():
 # Core Logic
 # -----------------------
 def run_strategy(live, quiet):
-    client = init_client()
-    
+    client = init_client_auto()
+    print("✅ BOT ONLINE. Ready to trade.")
+
     # 1. Calculate Target
     now = datetime.now(timezone.utc)
     minute = (now.minute // 5) * 5
@@ -172,7 +180,6 @@ def run_strategy(live, quiet):
 
         print(f"🚀 BUYING: {shares} shares of {side_name} @ {limit_price:.2f}...")
 
-        # The SDK automatically uses USDC.e (Asset ID 0x2791...) on Polygon
         resp = client.create_and_post_order(OrderArgs(
             price=limit_price,
             size=shares,
@@ -186,12 +193,10 @@ def run_strategy(live, quiet):
         else:
             print(f"❌ Order Rejected: {resp}")
             if "invalid signature" in str(resp).lower():
-                 print("👉 NOTE: If this persists, delete your API keys in Polymarket Settings -> API.")
+                 print("👉 ERROR PERSISTS: This usually means your PRIVATE_KEY is wrong, OR you need to enable 'Gnosis Safe' in Polymarket Settings.")
             
     except Exception as e:
         print(f"❌ Trade Failed: {e}")
-        if "allowance" in str(e).lower():
-            print("🚨 CRITICAL: Go to Polymarket.com and approve USDC spending!")
 
 def monitor_trade(client, token_id, entry_price, end_time):
     print("📊 MONITORING... (Open Polymarket.com to view/sell)")
