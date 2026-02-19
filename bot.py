@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v12.0 - 15-Minute Edition).
-- MARKET: Switched to 15-minute BTC markets for drastically better liquidity.
-- BINANCE DATA: Analyzes the last 15 minutes to match the trade duration.
-- SLUG HUNTER: Automatically finds the correct Polymarket naming convention.
+Railway-ready Direct Polymarket Bot (v12.2 - The Bug Fix Edition).
+- MARKET: 15-minute BTC markets.
+- BUG FIX: Bypasses the broken py-clob-client get_order_book() method.
+- REAL DATA: Uses get_price() to fetch the true live spread.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,21 +14,20 @@ from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🚀 STRATEGY SETTINGS (v12.0 - 15-MINUTE ZONE)
+# 🚀 STRATEGY SETTINGS (v12.2)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.05      # Needs a slightly stronger 15m trend to enter
-MAX_SPREAD = 0.35          # Capital protection guard (allows up to 35c gap)
+BASE_THRESHOLD = 0.05      # Standard 15m trend requirement
+MAX_SPREAD = 0.20          # Safely back to 20c now that we have REAL data
 MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.25     
-CLOSE_BUFFER_SECONDS = 90  # Extra breathing room before the 15m expiry
+CLOSE_BUFFER_SECONDS = 90  
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 DATA_API_POSITIONS = "https://data-api.polymarket.com/positions"
-# Grab 15 candles (15 minutes of data) to calculate the trend
 BINANCE_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=15"
 
 STATE_DIR = os.getenv("STATE_DIR", "/data")
@@ -66,7 +65,7 @@ def ensure_lock():
         os.write(fd, str(os.getpid()).encode())
         os.close(fd)
     except FileExistsError: 
-        die("⚠️ Duplicate instance detected. Exiting to prevent conflicts.")
+        die("⚠️ Duplicate instance detected. Exiting.")
         
     def _cleanup():
         try:
@@ -101,7 +100,6 @@ def compute_binance_trend():
     except: return None
 
 def get_market_tokens(base_ts: int):
-    # Polymarket sometimes changes the slug formatting. We check both common 15m structures.
     slugs = [f"btc-updown-15m-{base_ts}", f"btc-up-or-down-15m-{base_ts}"]
     for slug in slugs:
         try:
@@ -115,22 +113,29 @@ def get_market_tokens(base_ts: int):
     return None
 
 def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float):
-    ob = client.get_order_book(token_id)
-    if not ob.asks or not ob.bids: 
-        raise RuntimeError("Empty order book.")
+    # --- SDK BUG FIX: Bypass broken order book, fetch live price ---
+    ask_resp = client.get_price(token_id, side=BUY)
+    bid_resp = client.get_price(token_id, side=SELL)
     
-    bid = float(ob.bids[0].price)
-    ask = float(ob.asks[0].price)
+    if not isinstance(ask_resp, dict) or not isinstance(bid_resp, dict):
+        raise RuntimeError("Invalid response from Polymarket Live Price API.")
+        
+    ask_str = ask_resp.get("price")
+    bid_str = bid_resp.get("price")
+    
+    if ask_str is None or bid_str is None:
+        raise RuntimeError("No live pricing available right now.")
+        
+    ask = float(ask_str)
+    bid = float(bid_str)
     spread = ask - bid
     
-    print(f"📊 Market Stats (15m): Ask={ask:.2f} | Bid={bid:.2f} | Spread={spread:.2f}", flush=True)
+    print(f"📊 LIVE Market Stats: Ask={ask:.2f} | Bid={bid:.2f} | Spread={spread:.2f}", flush=True)
     
-    # --- DYNAMIC RISK LOGIC ---
     if spread > MAX_SPREAD:
         raise RuntimeError(f"Spread {spread:.2f} too extreme. Capital protection active.")
     
-    # If spread is wide, we need more momentum to justify the entry
-    required_mom = BASE_THRESHOLD if spread < 0.15 else BASE_THRESHOLD * 2.0
+    required_mom = BASE_THRESHOLD if spread < 0.10 else BASE_THRESHOLD * 2.0
     if abs(momentum) < required_mom:
         raise RuntimeError(f"Momentum {abs(momentum):.3f}% too weak to justify spread {spread:.2f}.")
 
@@ -165,7 +170,7 @@ def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time
             if pct_pnl >= (TAKE_PROFIT_PCT * 100) or utc_now() >= target_time:
                 print("🧾 EXITING POSITION...", flush=True)
                 client.create_and_post_order(OrderArgs(price=0.01, size=float(pos['size']), side=SELL, token_id=token_id))
-                clear_state() # Clear state immediately to avoid sell loops
+                clear_state()
                 return
         except Exception as e: 
             pass
@@ -195,7 +200,6 @@ def run(live: bool):
     if live:
         try:
             place_buy(client, token_id, MAX_BET_SIZE, mom)
-            # Add 15 minutes to the window start time to get the expiry
             monitor_and_autoclose(client, user, token_id, ws + timedelta(minutes=15))
         except Exception as e: 
             print(f"❌ {e}", flush=True)
