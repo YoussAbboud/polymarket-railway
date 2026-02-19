@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v12.2 - The Bug Fix Edition).
-- MARKET: 15-minute BTC markets.
-- BUG FIX: Bypasses the broken py-clob-client get_order_book() method.
-- REAL DATA: Uses get_price() to fetch the true live spread.
+Railway-ready Direct Polymarket Bot (v12.4 - The Middle Ground).
+- FIX 1: Max Spread tightened to 0.08c to prevent heavy instant losses.
+- FIX 2: Removed the +0.01 'Fill Penalty' to get better entry EV.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,13 +13,14 @@ from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🚀 STRATEGY SETTINGS (v12.2)
+# 🚀 STRATEGY SETTINGS (v12.4)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.05      # Standard 15m trend requirement
-MAX_SPREAD = 0.20          # Safely back to 20c now that we have REAL data
+BASE_THRESHOLD = 0.05      
+MAX_SPREAD = 0.08          # Tightened from 0.20 to prevent -15% open
 MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.25     
+STOP_LOSS_PCT = 0.25       
 CLOSE_BUFFER_SECONDS = 90  
 # ==============================================================================
 
@@ -113,7 +113,6 @@ def get_market_tokens(base_ts: int):
     return None
 
 def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float):
-    # --- SDK BUG FIX: Bypass broken order book, fetch live price ---
     ask_resp = client.get_price(token_id, side=BUY)
     bid_resp = client.get_price(token_id, side=SELL)
     
@@ -135,23 +134,25 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if spread > MAX_SPREAD:
         raise RuntimeError(f"Spread {spread:.2f} too extreme. Capital protection active.")
     
-    required_mom = BASE_THRESHOLD if spread < 0.10 else BASE_THRESHOLD * 2.0
+    required_mom = BASE_THRESHOLD if spread < 0.05 else BASE_THRESHOLD * 2.0
     if abs(momentum) < required_mom:
         raise RuntimeError(f"Momentum {abs(momentum):.3f}% too weak to justify spread {spread:.2f}.")
 
     if ask > 0.80: 
         raise RuntimeError("Price too high (Bad EV).")
 
-    price = min(round(ask + 0.01, 2), 0.80)
+    # Removed the +0.01 penalty to get better entries
+    price = min(ask, 0.80)
     size = round(dollars / price, 4) 
     
-    print(f"🚀 TAKING RISK: Buying {size} shares @ {price}...", flush=True)
+    print(f"🚀 TAKING CALCULATED RISK: Buying {size} shares @ {price}...", flush=True)
     resp = client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
     return resp.get("orderID")
 
 def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time: datetime):
     print("📊 MONITORING 15m POSITION...", flush=True)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    not_found_count = 0 
     
     while True:
         try:
@@ -160,15 +161,26 @@ def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time
             pos = next((p for p in pos_list if str(p.get("asset")) == str(token_id) and float(p.get("size") or 0) > 0), None)
             
             if not pos:
+                not_found_count += 1
+                if not_found_count <= 10:  
+                    time.sleep(2)
+                    continue
                 print("✅ Position closed or resolved.", flush=True)
                 clear_state()
                 return
+            else:
+                not_found_count = 0  
             
             pct_pnl = float(pos.get("percentPnl") or 0.0)
             print(f"⏱️ PnL: {pct_pnl:+.1f}%", flush=True)
 
-            if pct_pnl >= (TAKE_PROFIT_PCT * 100) or utc_now() >= target_time:
-                print("🧾 EXITING POSITION...", flush=True)
+            trigger = None
+            if pct_pnl >= (TAKE_PROFIT_PCT * 100): trigger = "TAKE PROFIT"
+            elif pct_pnl <= -(STOP_LOSS_PCT * 100): trigger = "STOP LOSS"
+            elif utc_now() >= target_time: trigger = "TIME LIMIT"
+
+            if trigger:
+                print(f"🧾 EXITING POSITION: {trigger}", flush=True)
                 client.create_and_post_order(OrderArgs(price=0.01, size=float(pos['size']), side=SELL, token_id=token_id))
                 clear_state()
                 return
