@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (stable monitor + auto-close).
+Railway-ready Direct Polymarket Bot (v10.7 - Data API Sync Fix).
 
 Key fixes:
-- Auth happens FIRST and only once.
-- Prevents multiple concurrent BTC 5m positions (uses Data API /positions).
-- Fill + PnL tracking uses Data API (matches website).
-- Ignores markets older than 15 minutes to prevent getting stuck on unredeemed winnings.
-- Gracefully exits if the market resolves and the orderbook ceases to exist.
+- Added a 20-second "Grace Period" to the Data API. The indexer lags behind the 
+  orderbook execution, so the bot will now wait for the database to catch up 
+  before assuming a position is closed.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -228,11 +226,9 @@ def find_any_open_btc5m_positions(user: str):
         size = float(p.get("size") or 0)
         
         if size > 0 and slug.startswith(prefix):
-            # FIX: Ignore markets that started more than 15 minutes ago.
-            # This prevents the bot from trying to sell unredeemed winning shares.
             try:
                 ts = int(slug.split("-")[-1])
-                if now_ts - ts > 900:  # 900 seconds = 15 minutes
+                if now_ts - ts > 900:  
                     continue
             except Exception:
                 pass
@@ -306,16 +302,28 @@ def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time
     sl = -sl_pct * 100.0
 
     last_line_ts = 0.0
+    not_found_count = 0  # FIX: Tracker for indexer lag
 
     while True:
         now = utc_now()
         secs_left = int((target_time - now).total_seconds())
 
         pos = find_position_for_asset(user, token_id)
+        
+        # FIX: The Grace Period Check
         if not pos:
-            print("✅ Position not found in Data API (closed/resolved).", flush=True)
-            clear_state()
-            return
+            not_found_count += 1
+            if not_found_count <= 25:  # Roughly 20-25 seconds of grace period
+                if not_found_count == 1:
+                    print("⏳ Waiting for Data API to sync the new position...", flush=True)
+                time.sleep(1)
+                continue
+            else:
+                print("✅ Position not found in Data API after sync wait (closed/resolved).", flush=True)
+                clear_state()
+                return
+        else:
+            not_found_count = 0  # Reset once found
 
         avg_c = float(pos.get("avgPrice") or 0.0)
         cur_c = float(pos.get("curPrice") or 0.0)
@@ -352,22 +360,22 @@ def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time
                     err_str = str(e).lower()
                     print(f"⚠️ Sell attempt {attempt}/10 failed: {e}", flush=True)
                     
-                    # FIX: If the market is resolved, the orderbook is gone. Stop trying to sell.
                     if "orderbook" in err_str and "does not exist" in err_str:
                         print("🚨 Market resolved. Orderbook is closed. Exiting monitor.", flush=True)
                         clear_state()
                         return
 
             time.sleep(1.5)
+            # We don't need a heavy grace period on the sell, we just assume it worked 
+            # if place_sell didn't throw an exception, but we check to be safe.
             pos2 = find_position_for_asset(user, token_id)
             if not pos2 or float(pos2.get("size") or 0.0) <= 0:
-                print("✅ CLOSED (position size is now 0).", flush=True)
+                print("✅ CLOSED (confirmed by Data API).", flush=True)
                 clear_state()
                 return
 
             size = float(pos2.get("size") or size)
-
-            print("⚠️ Could not confirm close after retries. Position may still be open.", flush=True)
+            print("⏳ Sell order sent, waiting for Data API to reflect the change...", flush=True)
         else:
             if secs_left < -120:
                 print("⚠️ Monitor timeout past buffer. Exiting.", flush=True)
