@@ -20,7 +20,7 @@ ASSET = "BTC"
 BASE_THRESHOLD = 0.04      # Needs a sharp 5m move to predict the 15m outcome
 MAX_SPREAD = 0.10          # Balanced: Allows entry but blocks total rip-offs
 MAX_BET_SIZE = 5.0
-TAKE_PROFIT_PCT = 0.25     
+TAKE_PROFIT_PCT = 0.18     
 STOP_LOSS_PCT = 0.40       # Smart stop loss to cut the cord on bad trades
 CLOSE_BUFFER_SECONDS = 90  
 # ==============================================================================
