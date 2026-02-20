@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v12.4 - The Middle Ground).
-- FIX 1: Max Spread tightened to 0.08c to prevent heavy instant losses.
-- FIX 2: Removed the +0.01 'Fill Penalty' to get better entry EV.
+Railway-ready Direct Polymarket Bot (v14.0 - The Predictive Sniper).
+- MARKET: 15-minute BTC markets.
+- LEADING INDICATOR: Uses 5-minute Binance lookback to front-run the 15m trend.
+- SMART STOP LOSS: Hard cap at -40% to prevent total expiration burn.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -13,14 +14,14 @@ from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🚀 STRATEGY SETTINGS (v12.4)
+# 🎯 STRATEGY SETTINGS (v14.0 - PREDICTIVE SNIPER)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.05      
-MAX_SPREAD = 0.08          # Tightened from 0.20 to prevent -15% open
+BASE_THRESHOLD = 0.04      # Needs a sharp 5m move to predict the 15m outcome
+MAX_SPREAD = 0.10          # Balanced: Allows entry but blocks total rip-offs
 MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.25     
-STOP_LOSS_PCT = 0.25       
+STOP_LOSS_PCT = 0.40       # Smart stop loss to cut the cord on bad trades
 CLOSE_BUFFER_SECONDS = 90  
 # ==============================================================================
 
@@ -28,7 +29,8 @@ HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 DATA_API_POSITIONS = "https://data-api.polymarket.com/positions"
-BINANCE_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=15"
+# SHORTENED: Grab only 5 candles (5 minutes of data) for leading momentum
+BINANCE_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5"
 
 STATE_DIR = os.getenv("STATE_DIR", "/data")
 STATE_PATH = os.path.join(STATE_DIR, "pm_state.json")
@@ -92,7 +94,7 @@ def compute_binance_trend():
     try:
         r = SESSION.get(BINANCE_URL, timeout=5)
         data = safe_json(r)
-        if not data or len(data) < 15: return None
+        if not data or len(data) < 5: return None
         
         old_close = float(data[0][4])
         current_close = float(data[-1][4])
@@ -134,18 +136,16 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if spread > MAX_SPREAD:
         raise RuntimeError(f"Spread {spread:.2f} too extreme. Capital protection active.")
     
-    required_mom = BASE_THRESHOLD if spread < 0.05 else BASE_THRESHOLD * 2.0
-    if abs(momentum) < required_mom:
-        raise RuntimeError(f"Momentum {abs(momentum):.3f}% too weak to justify spread {spread:.2f}.")
+    if abs(momentum) < BASE_THRESHOLD:
+        raise RuntimeError(f"Momentum {abs(momentum):.3f}% too weak to justify entry.")
 
-    if ask > 0.80: 
-        raise RuntimeError("Price too high (Bad EV).")
+    if ask > 0.75: 
+        raise RuntimeError("Price too high (Bad EV). Will not chase.")
 
-    # Removed the +0.01 penalty to get better entries
-    price = min(ask, 0.80)
+    price = min(ask, 0.75)
     size = round(dollars / price, 4) 
     
-    print(f"🚀 TAKING CALCULATED RISK: Buying {size} shares @ {price}...", flush=True)
+    print(f"🚀 SNIPER ENTRY: Buying {size} shares @ {price}...", flush=True)
     resp = client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
     return resp.get("orderID")
 
@@ -199,7 +199,7 @@ def run(live: bool):
         print("⚠️ Could not fetch Binance data.", flush=True)
         return
         
-    print(f"🕒 Window: {ws.strftime('%H:%M')} UTC | 📈 Binance Trend (15m): {mom:+.3f}%", flush=True)
+    print(f"🕒 Window: {ws.strftime('%H:%M')} UTC | 📈 Binance Trend (5m -> 15m): {mom:+.3f}%", flush=True)
 
     tokens = get_market_tokens(int(ws.timestamp()))
     if not tokens: 
