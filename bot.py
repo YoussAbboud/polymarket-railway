@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v14.5 - Live CLOB Sync).
-- API BYPASS: Completely severs reliance on the lagging Polymarket Gamma database.
-- BLOCKCHAIN SYNC: Uses get_balance_allowance to instantly detect manual website sells.
-- MULTI-SNIPE: Automatically unlocks for re-entry when token balance hits zero.
+Railway-ready Direct Polymarket Bot (v14.6 - The Hybrid Sync).
+- PNL MATH: Uses instant live CLOB Bid prices (No slippage lag).
+- MANUAL EXIT: Uses Gamma Data API to securely detect manual website sells.
+- SYNC LOCK: Immune to proxy-wallet balance bugs and API indexing delays.
 """
 
 import os, sys, json, time, argparse, atexit
 from datetime import datetime, timezone, timedelta
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v14.5)
+# 🎯 STRATEGY SETTINGS (v14.6)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -28,6 +28,7 @@ CLOSE_BUFFER_SECONDS = 120
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+DATA_API_POSITIONS = "https://data-api.polymarket.com/positions"
 BINANCE_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5"
 
 STATE_DIR = os.getenv("STATE_DIR", "/data")
@@ -103,7 +104,7 @@ def init_client():
     print(f"🔐 Auth Init (Type {sig_type}) ...", flush=True)
     client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
-    return client
+    return client, funder
 
 def compute_binance_trend():
     try:
@@ -164,10 +165,12 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
     return price, size
 
-def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float, ws: datetime):
-    print("📊 MONITORING 15m POSITION (Live CLOB + Blockchain Balance Sync)...", flush=True)
+def monitor_and_autoclose(client: ClobClient, user: str, token_id: str, end_time: datetime, entry_price: float, size: float, ws: datetime):
+    print("📊 MONITORING 15m POSITION (Hybrid Sync: CLOB PnL + Gamma Manual Check)...", flush=True)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    
     loop_count = 0
+    api_sync_achieved = False
     
     while True:
         try:
@@ -199,21 +202,23 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                             return
                         print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
 
-            # 2. MANUAL EXIT CHECK: Ask the blockchain for real token balance every ~10s
+            # 2. MANUAL EXIT CHECK: Wait for Gamma to see the buy, then watch for the sell
             loop_count += 1
             if loop_count % 5 == 0:
                 try:
-                    resp = client.get_balance_allowance(
-                        BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                    )
-                    current_balance = float(resp.get("balance", 0))
+                    r = SESSION.get(DATA_API_POSITIONS, params={"user": user}, timeout=5)
+                    pos_list = safe_json(r) or []
+                    pos = next((p for p in pos_list if str(p.get("asset")) == str(token_id) and float(p.get("size") or 0) > 0), None)
                     
-                    if current_balance < 0.01:
-                        print("✅ CLOB confirms shares are sold. Exiting monitor.", flush=True)
+                    if pos:
+                        if not api_sync_achieved:
+                            print("🔗 Database synced. Bot is now monitoring for manual website exits.", flush=True)
+                        api_sync_achieved = True
+                    elif api_sync_achieved and not pos:
+                        print("✅ Position manually closed on Polymarket website. Exiting monitor.", flush=True)
                         save_position_state(ws, False) # Unlocks the bot to snipe again
                         return
-                except Exception as e: 
-                    pass 
+                except: pass
 
         except Exception as e: 
             pass 
@@ -221,7 +226,7 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
 
 def run(live: bool):
     ensure_process_lock()
-    client = init_client()
+    client, user = init_client()
     now = utc_now()
     ws = round_to_15m(now)
     
@@ -230,7 +235,7 @@ def run(live: bool):
     if state and state.get("window") == int(ws.timestamp()) and state.get("has_position"):
         print("🔄 Found active open position for this window. Resuming monitoring...", flush=True)
         if live:
-            monitor_and_autoclose(client, state["token_id"], ws + timedelta(minutes=15), state["entry_price"], state["size"], ws)
+            monitor_and_autoclose(client, user, state["token_id"], ws + timedelta(minutes=15), state["entry_price"], state["size"], ws)
         return
     
     mom = compute_binance_trend()
@@ -252,7 +257,7 @@ def run(live: bool):
         try:
             entry_price, size = place_buy(client, token_id, MAX_BET_SIZE, mom)
             save_position_state(ws, True, entry_price, size, token_id) 
-            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price, size, ws)
+            monitor_and_autoclose(client, user, token_id, ws + timedelta(minutes=15), entry_price, size, ws)
         except Exception as e: 
             print(f"❌ {e}", flush=True)
 
