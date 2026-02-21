@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v14.2 - The API Bypass).
-- FIX 1: Completely bypasses the lagging Gamma Data API for monitoring.
-- FIX 2: Calculates live PnL mathematically using the CLOB Bid price.
-- PREDICTIVE SNIPER: Retains the 5-minute leading indicator.
+Railway-ready Direct Polymarket Bot (v14.5 - Live CLOB Sync).
+- API BYPASS: Completely severs reliance on the lagging Polymarket Gamma database.
+- BLOCKCHAIN SYNC: Uses get_balance_allowance to instantly detect manual website sells.
+- MULTI-SNIPE: Automatically unlocks for re-entry when token balance hits zero.
 """
 
 import os, sys, json, time, argparse, atexit
 from datetime import datetime, timezone, timedelta
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v14.2)
+# 🎯 STRATEGY SETTINGS (v14.5)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
-TAKE_PROFIT_PCT = 0.18     
-STOP_LOSS_PCT = 0.33       
+TAKE_PROFIT_PCT = 0.15     
+STOP_LOSS_PCT = 0.30       
 CLOSE_BUFFER_SECONDS = 120 
 # ==============================================================================
 
@@ -31,7 +31,7 @@ GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 BINANCE_URL = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5"
 
 STATE_DIR = os.getenv("STATE_DIR", "/data")
-STATE_PATH = os.path.join(STATE_DIR, "window_lock.json")
+STATE_PATH = os.path.join(STATE_DIR, "position_state.json")
 LOCK_PATH = os.path.join(STATE_DIR, "pm_lock")
 SESSION = requests.Session()
 
@@ -54,21 +54,27 @@ def safe_json(resp: requests.Response):
     try: return resp.json()
     except: return None
 
-# --- IRONCLAD MEMORY ---
-def get_last_traded_window():
+# --- ACTIVE POSITION MEMORY ---
+def get_position_state():
     try:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, 'r') as f:
-                return json.load(f).get("last_window")
+                return json.load(f)
     except: return None
 
-def mark_traded_window(ws_ts: datetime):
+def save_position_state(ws_ts: datetime, has_pos: bool, entry: float=0.0, size: float=0.0, token_id: str=""):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(STATE_PATH, 'w') as f:
-            json.dump({"last_window": int(ws_ts.timestamp())}, f)
+            json.dump({
+                "window": int(ws_ts.timestamp()),
+                "has_position": has_pos,
+                "entry_price": entry,
+                "size": size,
+                "token_id": token_id
+            }, f)
     except Exception as e:
-        print(f"⚠️ Failed to save window state: {e}", flush=True)
+        print(f"⚠️ Failed to save position state: {e}", flush=True)
 
 def ensure_process_lock():
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -97,7 +103,7 @@ def init_client():
     print(f"🔐 Auth Init (Type {sig_type}) ...", flush=True)
     client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
-    return client, funder
+    return client
 
 def compute_binance_trend():
     try:
@@ -156,60 +162,75 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     
     print(f"🚀 SNIPER ENTRY: Buying {size} shares @ {price}...", flush=True)
     client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
-    
-    # Return exactly what we bought so the monitor function can track it offline
     return price, size
 
-def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
-    print("📊 MONITORING 15m POSITION (Live CLOB Bypass)...", flush=True)
+def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float, ws: datetime):
+    print("📊 MONITORING 15m POSITION (Live CLOB + Blockchain Balance Sync)...", flush=True)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
+    loop_count = 0
     
     while True:
         try:
-            # Bypass the Data API entirely. Ask the live market what our shares are worth right now.
+            # 1. FAST PNL: Ask the CLOB for the live Bid price
             bid_resp = client.get_price(token_id, side=SELL)
             bid_str = bid_resp.get("price")
             
-            if not bid_str:
-                time.sleep(2)
-                continue
-                
-            current_bid = float(bid_str)
-            
-            # Mathematically calculate our exact PnL
-            pct_pnl = ((current_bid - entry_price) / entry_price) * 100.0
-            
-            print(f"⏱️ PnL: {pct_pnl:+.1f}% (Current Bid: {current_bid:.2f})", flush=True)
+            if bid_str:
+                current_bid = float(bid_str)
+                pct_pnl = ((current_bid - entry_price) / entry_price) * 100.0
+                print(f"⏱️ PnL: {pct_pnl:+.1f}% (Current Bid: {current_bid:.2f})", flush=True)
 
-            trigger = None
-            if pct_pnl >= (TAKE_PROFIT_PCT * 100): trigger = "TAKE PROFIT"
-            elif pct_pnl <= -(STOP_LOSS_PCT * 100): trigger = "STOP LOSS"
-            elif utc_now() >= target_time: trigger = "TIME LIMIT"
+                trigger = None
+                if pct_pnl >= (TAKE_PROFIT_PCT * 100): trigger = "TAKE PROFIT"
+                elif pct_pnl <= -(STOP_LOSS_PCT * 100): trigger = "STOP LOSS"
+                elif utc_now() >= target_time: trigger = "TIME LIMIT"
 
-            if trigger:
-                print(f"🧾 EXITING POSITION: {trigger}", flush=True)
-                try:
-                    client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
-                    print(f"✅ Sell order executed successfully for {trigger}.", flush=True)
-                    return
-                except Exception as sell_err:
-                    if "insufficient balance" in str(sell_err).lower():
-                        print("✅ Position already closed manually or resolved.", flush=True)
+                if trigger:
+                    print(f"🧾 EXITING POSITION: {trigger}", flush=True)
+                    try:
+                        client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order executed successfully for {trigger}.", flush=True)
+                        save_position_state(ws, False) 
                         return
-                    print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
+                    except Exception as sell_err:
+                        if "insufficient balance" in str(sell_err).lower():
+                            print("✅ Position already closed manually or resolved.", flush=True)
+                            save_position_state(ws, False)
+                            return
+                        print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
+
+            # 2. MANUAL EXIT CHECK: Ask the blockchain for real token balance every ~10s
+            loop_count += 1
+            if loop_count % 5 == 0:
+                try:
+                    resp = client.get_balance_allowance(
+                        BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                    )
+                    current_balance = float(resp.get("balance", 0))
                     
+                    if current_balance < 0.01:
+                        print("✅ CLOB confirms shares are sold. Exiting monitor.", flush=True)
+                        save_position_state(ws, False) # Unlocks the bot to snipe again
+                        return
+                except Exception as e: 
+                    pass 
+
         except Exception as e: 
             pass 
         time.sleep(2)
 
 def run(live: bool):
     ensure_process_lock()
-    client, user = init_client()
+    client = init_client()
     now = utc_now()
     ws = round_to_15m(now)
     
-    last_window = get_last_traded_window()
-    if last_window == int(ws.timestamp()):
+    # --- CHECK ACTIVE POSITION STATE ---
+    state = get_position_state()
+    if state and state.get("window") == int(ws.timestamp()) and state.get("has_position"):
+        print("🔄 Found active open position for this window. Resuming monitoring...", flush=True)
+        if live:
+            monitor_and_autoclose(client, state["token_id"], ws + timedelta(minutes=15), state["entry_price"], state["size"], ws)
         return
     
     mom = compute_binance_trend()
@@ -230,8 +251,8 @@ def run(live: bool):
     if live:
         try:
             entry_price, size = place_buy(client, token_id, MAX_BET_SIZE, mom)
-            mark_traded_window(ws) 
-            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price, size)
+            save_position_state(ws, True, entry_price, size, token_id) 
+            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price, size, ws)
         except Exception as e: 
             print(f"❌ {e}", flush=True)
 
