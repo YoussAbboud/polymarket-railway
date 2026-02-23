@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v15.4 - The Precision Exit).
-- EXACT BALANCE FIX: Fetches the precise blockchain balance before selling to avoid floating-point errors.
-- STABLE BASE: Retains the v15.3 CLOB PnL, EV Floor, Hard Time Kill, and single-snipe logic.
+Railway-ready Direct Polymarket Bot (v15.7 - The Precision Fix).
+- DECIMAL FIX: Strictly rounds the sell size to 4 decimals to prevent "not enough balance" API rejections.
+- PRE-FLIGHT VERIFICATION: Checks actual blockchain balance *before* monitoring.
+- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -13,7 +14,7 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v15.4)
+# 🎯 STRATEGY SETTINGS (v15.7)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -22,6 +23,7 @@ MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.18     
 STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
+MAX_TRADES_PER_WINDOW = 3  
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
@@ -53,19 +55,22 @@ def safe_json(resp: requests.Response):
     try: return resp.json()
     except: return None
 
-# --- IRONCLAD MEMORY (1 Trade Per Window) ---
-def get_last_traded_window():
+def get_trade_count(ws_ts: datetime):
     try:
         if os.path.exists(STATE_PATH):
             with open(STATE_PATH, 'r') as f:
-                return json.load(f).get("last_window")
-    except: return None
+                data = json.load(f)
+                if data.get("window") == int(ws_ts.timestamp()):
+                    return data.get("count", 0)
+    except: pass
+    return 0
 
-def mark_traded_window(ws_ts: datetime):
+def increment_trade_count(ws_ts: datetime):
     try:
+        count = get_trade_count(ws_ts) + 1
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(STATE_PATH, 'w') as f:
-            json.dump({"last_window": int(ws_ts.timestamp())}, f)
+            json.dump({"window": int(ws_ts.timestamp()), "count": count}, f)
     except Exception as e:
         print(f"⚠️ Failed to save window state: {e}", flush=True)
 
@@ -157,7 +162,34 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     size = round(dollars / price, 4) 
     
     print(f"🚀 SNIPER ENTRY: Buying {size} shares @ {price}...", flush=True)
-    client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
+    resp = client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
+    
+    if isinstance(resp, dict) and resp.get("error"):
+        raise RuntimeError(f"Polymarket API rejected the BUY: {resp.get('error')}")
+        
+    order_id = resp.get("orderID")
+    if not order_id:
+        raise RuntimeError(f"BUY order failed to confirm. API Response: {resp}")
+        
+    print(f"✅ Order sent (ID: {order_id}). Waiting 3s to verify fill...", flush=True)
+    time.sleep(3) 
+    
+    try:
+        bal_resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        current_balance = float(bal_resp.get("balance", 0))
+        
+        if current_balance < (size * 0.5): 
+            print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
+            try: client.cancel(order_id)
+            except: pass
+            raise RuntimeError("Order did not fill immediately. Canceled to prevent ghost trade.")
+    except Exception as e:
+        if "ghost trade" in str(e): raise e
+        pass 
+        
+    print(f"✅ Receipt confirmed. Exact balance: {current_balance} shares.", flush=True)
     return price
 
 def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float):
@@ -186,19 +218,20 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 if trigger:
                     print(f"🧾 EXITING POSITION: {trigger} | Fetching exact balance...", flush=True)
                     try:
-                        # 🛑 THE FIX: Fetch the exact decimal balance from the blockchain
                         bal_resp = client.get_balance_allowance(
                             BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
                         )
-                        exact_balance = float(bal_resp.get("balance", 0))
+                        raw_balance = float(bal_resp.get("balance", 0))
                         
-                        if exact_balance < 0.01:
+                        # 🛑 THE FIX: Strictly round the sell size to 4 decimal places
+                        safe_sell_size = round(raw_balance, 4)
+                        
+                        if safe_sell_size < 0.01:
                             print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
                             return
                             
-                        # Sell the exact decimal balance
-                        client.create_and_post_order(OrderArgs(price=0.01, size=exact_balance, side=SELL, token_id=token_id))
-                        print(f"✅ Sell order ({exact_balance} shares) executed successfully for {trigger}.", flush=True)
+                        client.create_and_post_order(OrderArgs(price=0.01, size=safe_sell_size, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order ({safe_sell_size} shares) executed successfully for {trigger}.", flush=True)
                         return
                     except Exception as sell_err:
                         print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
@@ -212,9 +245,9 @@ def run(live: bool):
     now = utc_now()
     ws = round_to_15m(now)
     
-    last_window = get_last_traded_window()
-    if last_window == int(ws.timestamp()):
-        print("✅ Already traded in this 15m window. Sleeping.", flush=True)
+    trade_count = get_trade_count(ws)
+    if trade_count >= MAX_TRADES_PER_WINDOW:
+        print(f"✅ Already traded {MAX_TRADES_PER_WINDOW} times in this 15m window. Sleeping.", flush=True)
         return
     
     mom = compute_binance_trend()
@@ -235,7 +268,7 @@ def run(live: bool):
     if live:
         try:
             entry_price = place_buy(client, token_id, MAX_BET_SIZE, mom)
-            mark_traded_window(ws) 
+            increment_trade_count(ws) 
             monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price)
         except Exception as e: 
             print(f"❌ {e}", flush=True)
