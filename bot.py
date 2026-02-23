@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v16.0 - The Clean Engine).
-- REVERTED SELL LOGIC: Removed the hallucinated balance-fetching during the sell phase. It now cleanly sells the exact `size` it calculated during the buy.
-- PRE-FLIGHT VERIFICATION: Checks the balance directly after the buy to ensure no ghost trades.
-- STABLE BASE: Retains Triple Snipe, EV Floor, and the Hard Time Kill to prevent infinite loops.
+Railway-ready Direct Polymarket Bot (v16.1 - The Discord Dispatcher).
+- DISCORD ALERTS: Pushes live notifications to a Discord Webhook when positions open and close.
+- CLEAN ENGINE: Retains the stable v16.0 sell logic, exact size matching, and hard time kill.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,14 +13,14 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v16.0)
+# 🎯 STRATEGY SETTINGS (v16.1)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
-TAKE_PROFIT_PCT = 0.13     
-STOP_LOSS_PCT = 0.30       
+TAKE_PROFIT_PCT = 0.18     
+STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
 MAX_TRADES_PER_WINDOW = 3  
 # ==============================================================================
@@ -54,6 +53,16 @@ def round_to_15m(ts: datetime):
 def safe_json(resp: requests.Response): 
     try: return resp.json()
     except: return None
+
+# --- DISCORD INTEGRATION ---
+def send_discord_alert(msg: str):
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url: 
+        return
+    try:
+        requests.post(webhook_url, json={"content": msg}, timeout=5)
+    except Exception as e:
+        print(f"⚠️ Discord Alert Failed: {e}", flush=True)
 
 def get_trade_count(ws_ts: datetime):
     try:
@@ -180,7 +189,6 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         )
         current_balance = float(bal_resp.get("balance", 0))
         
-        # Pre-flight check: Make sure we actually received the shares before we track PnL
         if current_balance < (size * 0.5): 
             print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
             try: client.cancel(order_id)
@@ -191,6 +199,7 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         pass 
         
     print("✅ Receipt confirmed.", flush=True)
+    send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
     return price, size
 
 def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
@@ -199,7 +208,9 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
     
     while True:
         if utc_now() >= end_time:
-            print("⏳ Market reached hard expiration. Position locked by Polymarket. Exiting loop.", flush=True)
+            msg = "⏳ **MARKET EXPIRED**\nPosition locked by Polymarket. Awaiting automatic resolution."
+            print(msg, flush=True)
+            send_discord_alert(msg)
             return
 
         try:
@@ -219,9 +230,9 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 if trigger:
                     print(f"🧾 EXITING POSITION: {trigger} | Executing sell order...", flush=True)
                     try:
-                        # Reverted to passing the exact original size variable
                         client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
                         print(f"✅ Sell order ({size} shares) executed successfully for {trigger}.", flush=True)
+                        send_discord_alert(f"🔴 **POSITION CLOSED** [{trigger}]\nAction: Sold **{size}** shares\nEntry: **${entry_price:.2f}** | Exit PnL: **{pct_pnl:+.1f}%**")
                         return
                     except Exception as sell_err:
                         if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
