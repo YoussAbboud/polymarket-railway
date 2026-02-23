@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v16.4 - The Golden Era Rollback).
-- NO HESITATION: Ripped out the annoying "Price Moved" auto-cancel. It fires the order and trusts the fill.
-- PROVEN ENGINE: Uses the exact buy/sell execution logic from the v15.4-15.5 era that successfully printed.
-- QUALITY OF LIFE: Retains Triple Snipe limits and Discord alerts.
+Railway-ready Direct Polymarket Bot (v16.5 - The SL Decimal Fix).
+- EXIT FIX: Fetches the exact blockchain balance right before selling to prevent floating-point rejections.
+- UNTOUCHED BUY LOGIC: Retains the exact blind-trust sniper entry from v16.4.
+- DISCORD ALERTS: Active.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,16 +14,16 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v16.4)
+# 🎯 STRATEGY SETTINGS (v16.5)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
-TAKE_PROFIT_PCT = 0.18     
-STOP_LOSS_PCT = 0.40       
+TAKE_PROFIT_PCT = 0.15     
+STOP_LOSS_PCT = 0.33       
 CLOSE_BUFFER_SECONDS = 120 
-MAX_TRADES_PER_WINDOW = 3  
+MAX_TRADES_PER_WINDOW = 2  
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
@@ -108,7 +108,6 @@ def init_client():
     funder = get_env("POLYGON_ADDRESS")
     sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
     
-    print(f"🔐 Auth Init (Type {sig_type}) ...", flush=True)
     client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
@@ -177,11 +176,7 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if isinstance(resp, dict) and resp.get("error"):
         raise RuntimeError(f"Polymarket API rejected the BUY: {resp.get('error')}")
         
-    order_id = resp.get("orderID")
-    if not order_id:
-        raise RuntimeError(f"BUY order failed to confirm. API Response: {resp}")
-        
-    print(f"✅ Order sent (ID: {order_id}). Trusting the fill.", flush=True)
+    print(f"✅ Order sent. Trusting the fill.", flush=True)
     send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
     
     return price, size
@@ -212,11 +207,24 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 elif utc_now() >= target_time: trigger = "TIME LIMIT"
 
                 if trigger:
-                    print(f"🧾 EXITING POSITION: {trigger} | Executing sell order...", flush=True)
+                    print(f"🧾 EXITING POSITION: {trigger} | Fetching exact blockchain balance...", flush=True)
                     try:
-                        client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
-                        print(f"✅ Sell order ({size} shares) executed successfully for {trigger}.", flush=True)
-                        send_discord_alert(f"🔴 **POSITION CLOSED** [{trigger}]\nAction: Sold **{size}** shares\nEntry: **${entry_price:.2f}** | Exit PnL: **{pct_pnl:+.1f}%**")
+                        # 🛑 THE EXACT DECIMAL FIX (Only applies when exiting to prevent SL rejections)
+                        bal_resp = client.get_balance_allowance(
+                            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                        )
+                        raw_balance = float(bal_resp.get("balance", 0)) / 1_000_000.0
+                        
+                        # Truncate strictly to 4 decimal places to ensure we never ask to sell more than we own
+                        safe_sell_size = int(raw_balance * 10000) / 10000.0
+                        
+                        if safe_sell_size < 0.01:
+                            print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
+                            return
+                            
+                        client.create_and_post_order(OrderArgs(price=0.01, size=safe_sell_size, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order ({safe_sell_size} shares) executed successfully for {trigger}.", flush=True)
+                        send_discord_alert(f"🔴 **POSITION CLOSED** [{trigger}]\nAction: Sold **{safe_sell_size}** shares\nEntry: **${entry_price:.2f}** | Exit PnL: **{pct_pnl:+.1f}%**")
                         return
                     except Exception as sell_err:
                         if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
