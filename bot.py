@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v15.3 - The Loop Breaker).
-- HARD TIME KILL: Instantly breaks the monitoring loop if the market reaches expiration.
-- PHANTOM CATCHER: Stops looping if it detects a 0-balance error.
-- STABLE BASE: Retains the v15.0 CLOB PnL, EV Floor, and single-snipe logic.
+Railway-ready Direct Polymarket Bot (v15.4 - The Precision Exit).
+- EXACT BALANCE FIX: Fetches the precise blockchain balance before selling to avoid floating-point errors.
+- STABLE BASE: Retains the v15.3 CLOB PnL, EV Floor, Hard Time Kill, and single-snipe logic.
 """
 
 import os, sys, json, time, argparse, atexit
 from datetime import datetime, timezone, timedelta
 import requests
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs
+from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v15.3)
+# 🎯 STRATEGY SETTINGS (v15.4)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.18     
-STOP_LOSS_PCT = 0.33       
+STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
 # ==============================================================================
 
@@ -159,17 +158,15 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     
     print(f"🚀 SNIPER ENTRY: Buying {size} shares @ {price}...", flush=True)
     client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
-    return price, size
+    return price
 
-def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
+def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float):
     print("📊 MONITORING 15m POSITION (Live CLOB PnL Only)...", flush=True)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
     while True:
-        # 🛑 THE NEW FIX: HARD KILL SWITCH
-        # If the actual 15-minute window is over, the market is locked/expired. Break the loop immediately.
         if utc_now() >= end_time:
-            print("⏳ Market reached hard expiration. Position locked by Polymarket. Exiting infinite loop.", flush=True)
+            print("⏳ Market reached hard expiration. Position locked by Polymarket. Exiting loop.", flush=True)
             return
 
         try:
@@ -187,16 +184,23 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 elif utc_now() >= target_time: trigger = "TIME LIMIT"
 
                 if trigger:
-                    print(f"🧾 EXITING POSITION: {trigger}", flush=True)
+                    print(f"🧾 EXITING POSITION: {trigger} | Fetching exact balance...", flush=True)
                     try:
-                        client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
-                        print(f"✅ Sell order executed successfully for {trigger}.", flush=True)
-                        return
-                    except Exception as sell_err:
-                        # Safety net for Ghost Trades
-                        if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
+                        # 🛑 THE FIX: Fetch the exact decimal balance from the blockchain
+                        bal_resp = client.get_balance_allowance(
+                            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                        )
+                        exact_balance = float(bal_resp.get("balance", 0))
+                        
+                        if exact_balance < 0.01:
                             print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
                             return
+                            
+                        # Sell the exact decimal balance
+                        client.create_and_post_order(OrderArgs(price=0.01, size=exact_balance, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order ({exact_balance} shares) executed successfully for {trigger}.", flush=True)
+                        return
+                    except Exception as sell_err:
                         print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
         except Exception as e: 
             pass 
@@ -230,9 +234,9 @@ def run(live: bool):
     
     if live:
         try:
-            entry_price, size = place_buy(client, token_id, MAX_BET_SIZE, mom)
+            entry_price = place_buy(client, token_id, MAX_BET_SIZE, mom)
             mark_traded_window(ws) 
-            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price, size)
+            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price)
         except Exception as e: 
             print(f"❌ {e}", flush=True)
 
