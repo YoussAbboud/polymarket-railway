@@ -3,7 +3,7 @@
 Railway-ready Direct Polymarket Bot (v15.7 - The Precision Fix).
 - DECIMAL FIX: Strictly rounds the sell size to 4 decimals to prevent "not enough balance" API rejections.
 - PRE-FLIGHT VERIFICATION: Checks actual blockchain balance *before* monitoring.
-- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill.
+- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill. 
 """
 
 import os, sys, json, time, argparse, atexit
