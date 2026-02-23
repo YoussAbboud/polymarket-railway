@@ -21,7 +21,7 @@ BASE_THRESHOLD = 0.04
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
 TAKE_PROFIT_PCT = 0.18     
-STOP_LOSS_PCT = 0.40       
+STOP_LOSS_PCT = 0.33       
 CLOSE_BUFFER_SECONDS = 120 
 # ==============================================================================
 
