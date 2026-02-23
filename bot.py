@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v16.1 - The Discord Dispatcher).
-- DISCORD ALERTS: Pushes live notifications to a Discord Webhook when positions open and close.
-- CLEAN ENGINE: Retains the stable v16.0 sell logic, exact size matching, and hard time kill.
+Railway-ready Direct Polymarket Bot (v16.2 - The Aggressive Taker).
+- SLIPPAGE BUFFER: Adds +$0.02 to the Ask price when buying to guarantee immediate execution during high volatility.
+- DISCORD ALERTS: Pushes live notifications when positions open and close.
+- CLEAN ENGINE: Retains the stable sell logic, exact size matching, and hard time kill.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -13,7 +14,7 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v16.1)
+# 🎯 STRATEGY SETTINGS (v16.2)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -23,6 +24,7 @@ TAKE_PROFIT_PCT = 0.18
 STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
 MAX_TRADES_PER_WINDOW = 3  
+SLIPPAGE_CENTS = 0.02      # <--- NEW: Allows 2 cents of slippage to force fills
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
@@ -167,11 +169,16 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if ask < 0.30:
         raise RuntimeError("Price too low (Dead Token). Refusing to buy trash.")
 
-    price = min(ask, 0.75)
-    size = round(dollars / price, 4) 
+    # 🛑 THE NEW FIX: Aggressive Slippage Execution
+    # We calculate the target size based on the current Ask
+    target_price = min(ask, 0.75)
+    size = round(dollars / target_price, 4) 
     
-    print(f"🚀 SNIPER ENTRY: Buying {size} shares @ {price}...", flush=True)
-    resp = client.create_and_post_order(OrderArgs(price=price, size=size, side=BUY, token_id=token_id))
+    # But we tell Polymarket we are willing to pay slightly more to guarantee the fill
+    execution_price = min(ask + SLIPPAGE_CENTS, 0.75)
+    
+    print(f"🚀 AGGRESSIVE ENTRY: Sizing {size} shares @ {target_price:.2f} (Allowing slippage up to {execution_price:.2f})...", flush=True)
+    resp = client.create_and_post_order(OrderArgs(price=execution_price, size=size, side=BUY, token_id=token_id))
     
     if isinstance(resp, dict) and resp.get("error"):
         raise RuntimeError(f"Polymarket API rejected the BUY: {resp.get('error')}")
@@ -190,7 +197,7 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         current_balance = float(bal_resp.get("balance", 0))
         
         if current_balance < (size * 0.5): 
-            print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
+            print("⚠️ Price moved out of slippage range. Order stuck as an open maker order. Canceling...", flush=True)
             try: client.cancel(order_id)
             except: pass
             raise RuntimeError("Order did not fill immediately. Canceled to prevent ghost trade.")
@@ -199,8 +206,9 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         pass 
         
     print("✅ Receipt confirmed.", flush=True)
-    send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
-    return price, size
+    # We log the original target_price as our entry baseline for PnL calculations
+    send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares (~**${target_price:.2f}** base)\nBinance Momentum: `{momentum:+.3f}%`")
+    return target_price, size
 
 def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
     print("📊 MONITORING 15m POSITION (Live CLOB PnL Only)...", flush=True)
