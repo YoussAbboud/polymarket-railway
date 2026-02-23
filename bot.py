@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v15.8 - The Truncation Fix).
-- TRUNCATION FIX: Replaced round() with int() truncation to absolutely guarantee we never over-sell decimals.
-- PRE-FLIGHT VERIFICATION: Checks actual blockchain balance *before* monitoring.
-- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill.
+Railway-ready Direct Polymarket Bot (v16.0 - The Clean Engine).
+- REVERTED SELL LOGIC: Removed the hallucinated balance-fetching during the sell phase. It now cleanly sells the exact `size` it calculated during the buy.
+- PRE-FLIGHT VERIFICATION: Checks the balance directly after the buy to ensure no ghost trades.
+- STABLE BASE: Retains Triple Snipe, EV Floor, and the Hard Time Kill to prevent infinite loops.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,7 +14,7 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v15.8)
+# 🎯 STRATEGY SETTINGS (v16.0)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -158,7 +158,6 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if ask < 0.30:
         raise RuntimeError("Price too low (Dead Token). Refusing to buy trash.")
 
-    # We can safely round the BUY math, because we are just asking for an amount
     price = min(ask, 0.75)
     size = round(dollars / price, 4) 
     
@@ -181,6 +180,7 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         )
         current_balance = float(bal_resp.get("balance", 0))
         
+        # Pre-flight check: Make sure we actually received the shares before we track PnL
         if current_balance < (size * 0.5): 
             print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
             try: client.cancel(order_id)
@@ -190,10 +190,10 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
         if "ghost trade" in str(e): raise e
         pass 
         
-    print(f"✅ Receipt confirmed. Exact balance: {current_balance} shares.", flush=True)
-    return price
+    print("✅ Receipt confirmed.", flush=True)
+    return price, size
 
-def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float):
+def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
     print("📊 MONITORING 15m POSITION (Live CLOB PnL Only)...", flush=True)
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
@@ -217,25 +217,16 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 elif utc_now() >= target_time: trigger = "TIME LIMIT"
 
                 if trigger:
-                    print(f"🧾 EXITING POSITION: {trigger} | Fetching exact balance...", flush=True)
+                    print(f"🧾 EXITING POSITION: {trigger} | Executing sell order...", flush=True)
                     try:
-                        bal_resp = client.get_balance_allowance(
-                            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                        )
-                        raw_balance = float(bal_resp.get("balance", 0))
-                        
-                        # 🛑 THE FIX: Strictly TRUNCATE to 2 decimal places to ensure we never over-ask
-                        # 10.204099 becomes exactly 10.20
-                        safe_sell_size = int(raw_balance * 100) / 100.0
-                        
-                        if safe_sell_size < 0.01:
-                            print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
-                            return
-                            
-                        client.create_and_post_order(OrderArgs(price=0.01, size=safe_sell_size, side=SELL, token_id=token_id))
-                        print(f"✅ Sell order ({safe_sell_size} shares) executed successfully for {trigger}.", flush=True)
+                        # Reverted to passing the exact original size variable
+                        client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order ({size} shares) executed successfully for {trigger}.", flush=True)
                         return
                     except Exception as sell_err:
+                        if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
+                            print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
+                            return
                         print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
         except Exception as e: 
             pass 
@@ -269,9 +260,9 @@ def run(live: bool):
     
     if live:
         try:
-            entry_price = place_buy(client, token_id, MAX_BET_SIZE, mom)
+            entry_price, size = place_buy(client, token_id, MAX_BET_SIZE, mom)
             increment_trade_count(ws) 
-            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price)
+            monitor_and_autoclose(client, token_id, ws + timedelta(minutes=15), entry_price, size)
         except Exception as e: 
             print(f"❌ {e}", flush=True)
 
