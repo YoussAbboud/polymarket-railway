@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v15.7 - The Precision Fix).
-- DECIMAL FIX: Strictly rounds the sell size to 4 decimals to prevent "not enough balance" API rejections.
+Railway-ready Direct Polymarket Bot (v15.8 - The Truncation Fix).
+- TRUNCATION FIX: Replaced round() with int() truncation to absolutely guarantee we never over-sell decimals.
 - PRE-FLIGHT VERIFICATION: Checks actual blockchain balance *before* monitoring.
-- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill. 
+- STABLE BASE: Retains Triple Snipe, EV Floor, Exact Balance Exits, and Hard Time Kill.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,7 +14,7 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v15.7)
+# 🎯 STRATEGY SETTINGS (v15.8)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -158,6 +158,7 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if ask < 0.30:
         raise RuntimeError("Price too low (Dead Token). Refusing to buy trash.")
 
+    # We can safely round the BUY math, because we are just asking for an amount
     price = min(ask, 0.75)
     size = round(dollars / price, 4) 
     
@@ -223,8 +224,9 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                         )
                         raw_balance = float(bal_resp.get("balance", 0))
                         
-                        # 🛑 THE FIX: Strictly round the sell size to 4 decimal places
-                        safe_sell_size = round(raw_balance, 4)
+                        # 🛑 THE FIX: Strictly TRUNCATE to 2 decimal places to ensure we never over-ask
+                        # 10.204099 becomes exactly 10.20
+                        safe_sell_size = int(raw_balance * 100) / 100.0
                         
                         if safe_sell_size < 0.01:
                             print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
