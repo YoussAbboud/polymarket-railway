@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v15.0 - The Stable Rollback).
-- ROLLBACK: Reverted to the stable, profitable CLOB-only monitoring logic.
-- EV FLOOR: Added a 30-cent minimum price check to prevent buying dead 4-cent lottery tickets.
-- SINGLE SNIPE: Strict 1-trade-per-window lock. No overtrading.
+Railway-ready Direct Polymarket Bot (v15.3 - The Loop Breaker).
+- HARD TIME KILL: Instantly breaks the monitoring loop if the market reaches expiration.
+- PHANTOM CATCHER: Stops looping if it detects a 0-balance error.
+- STABLE BASE: Retains the v15.0 CLOB PnL, EV Floor, and single-snipe logic.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -14,13 +14,13 @@ from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v15.0 - STABLE ROLLBACK)
+# 🎯 STRATEGY SETTINGS (v15.3)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 5.0
-TAKE_PROFIT_PCT = 0.15     
+TAKE_PROFIT_PCT = 0.18     
 STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
 # ==============================================================================
@@ -151,7 +151,6 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if ask > 0.75: 
         raise RuntimeError("Price too high (Bad EV). Will not chase.")
         
-    # THE SECRET FIX: Do not buy dead 4-cent lottery tickets
     if ask < 0.30:
         raise RuntimeError("Price too low (Dead Token). Refusing to buy trash.")
 
@@ -167,6 +166,12 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
     target_time = end_time - timedelta(seconds=CLOSE_BUFFER_SECONDS)
     
     while True:
+        # 🛑 THE NEW FIX: HARD KILL SWITCH
+        # If the actual 15-minute window is over, the market is locked/expired. Break the loop immediately.
+        if utc_now() >= end_time:
+            print("⏳ Market reached hard expiration. Position locked by Polymarket. Exiting infinite loop.", flush=True)
+            return
+
         try:
             bid_resp = client.get_price(token_id, side=SELL)
             bid_str = bid_resp.get("price")
@@ -188,6 +193,10 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                         print(f"✅ Sell order executed successfully for {trigger}.", flush=True)
                         return
                     except Exception as sell_err:
+                        # Safety net for Ghost Trades
+                        if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
+                            print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
+                            return
                         print(f"⚠️ Sell Failed ({trigger}): {sell_err}. Retrying in 2s...", flush=True)
         except Exception as e: 
             pass 
