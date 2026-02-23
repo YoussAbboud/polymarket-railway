@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v16.1 - The Discord Dispatcher).
-- DISCORD ALERTS: Pushes live notifications to a Discord Webhook when positions open and close.
-- CLEAN ENGINE: Retains the stable v16.0 sell logic, exact size matching, and hard time kill.
+Railway-ready Direct Polymarket Bot (v16.4 - The Golden Era Rollback).
+- NO HESITATION: Ripped out the annoying "Price Moved" auto-cancel. It fires the order and trusts the fill.
+- PROVEN ENGINE: Uses the exact buy/sell execution logic from the v15.4-15.5 era that successfully printed.
+- QUALITY OF LIFE: Retains Triple Snipe limits and Discord alerts.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -13,7 +14,7 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v16.1)
+# 🎯 STRATEGY SETTINGS (v16.4)
 # ==============================================================================
 ASSET = "BTC"
 BASE_THRESHOLD = 0.04      
@@ -180,26 +181,9 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if not order_id:
         raise RuntimeError(f"BUY order failed to confirm. API Response: {resp}")
         
-    print(f"✅ Order sent (ID: {order_id}). Waiting 3s to verify fill...", flush=True)
-    time.sleep(3) 
-    
-    try:
-        bal_resp = client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-        )
-        current_balance = float(bal_resp.get("balance", 0))
-        
-        if current_balance < (size * 0.5): 
-            print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
-            try: client.cancel(order_id)
-            except: pass
-            raise RuntimeError("Order did not fill immediately. Canceled to prevent ghost trade.")
-    except Exception as e:
-        if "ghost trade" in str(e): raise e
-        pass 
-        
-    print("✅ Receipt confirmed.", flush=True)
+    print(f"✅ Order sent (ID: {order_id}). Trusting the fill.", flush=True)
     send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
+    
     return price, size
 
 def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
