@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v16.5 - The SL Decimal Fix).
-- EXIT FIX: Fetches the exact blockchain balance right before selling to prevent floating-point rejections.
-- UNTOUCHED BUY LOGIC: Retains the exact blind-trust sniper entry from v16.4.
+Railway-ready Direct Polymarket Bot (v17 - Sniper Edition).
+- EXIT FIX: Fetches the exact blockchain balance right before selling.
+- ENTRY FIX: Requires high momentum (0.15%) AND dominant aggressive volume (>55%).
+- RISK MANAGEMENT: Max 1 trade per 15m window to prevent revenge trading.
 - DISCORD ALERTS: Active.
 """
 
@@ -14,16 +15,16 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v16.5)
+# 🎯 STRATEGY SETTINGS (v17 - SNIPER MODE)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.04      
+BASE_THRESHOLD = 0.15      # INCREASED: Needs a real breakout, not just noise.
 MAX_SPREAD = 0.10          
-MAX_BET_SIZE = 3.3
+MAX_BET_SIZE = 10.0        # SCALED UP: $10 sniper shots.
 TAKE_PROFIT_PCT = 0.15     
 STOP_LOSS_PCT = 0.33       
 CLOSE_BUFFER_SECONDS = 120 
-MAX_TRADES_PER_WINDOW = 2  
+MAX_TRADES_PER_WINDOW = 1  # DECREASED: 1 shot per window. No revenge trading.
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
@@ -118,10 +119,44 @@ def compute_binance_trend():
         data = safe_json(r)
         if not data or len(data) < 5: return None
         
+        # Extract closing prices
         old_close = float(data[0][4])
         current_close = float(data[-1][4])
-        return ((current_close - old_close) / old_close) * 100.0
-    except: return None
+        
+        # Calculate Price Momentum
+        price_momentum = ((current_close - old_close) / old_close) * 100.0
+        
+        # Analyze Volume for the last 5 minutes 
+
+[Image of Volume Price Trend Indicator]
+
+        total_volume = 0
+        taker_buy_volume = 0
+        
+        for candle in data:
+            total_volume += float(candle[5])        # Total Base Volume
+            taker_buy_volume += float(candle[9])    # Taker Buy Base Asset Volume (Aggressive Buys)
+            
+        if total_volume == 0: return None
+        
+        buy_pressure_pct = (taker_buy_volume / total_volume) * 100.0
+        
+        print(f"🔍 Trend Check: Momentum {price_momentum:+.3f}% | Buy Pressure: {buy_pressure_pct:.1f}%", flush=True)
+
+        # THE SNIPER FILTER: 
+        if price_momentum > 0 and buy_pressure_pct < 55.0:
+            print("⚠️ Price moved UP, but volume is weak. Ignoring fake-out.", flush=True)
+            return 0.0 
+            
+        if price_momentum < 0 and buy_pressure_pct > 45.0:
+            print("⚠️ Price moved DOWN, but sell volume is weak. Ignoring fake-out.", flush=True)
+            return 0.0
+
+        return price_momentum
+        
+    except Exception as e: 
+        print(f"⚠️ Binance Fetch Error: {e}")
+        return None
 
 def get_market_tokens(base_ts: int):
     slugs = [f"btc-updown-15m-{base_ts}", f"btc-up-or-down-15m-{base_ts}"]
@@ -209,13 +244,11 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 if trigger:
                     print(f"🧾 EXITING POSITION: {trigger} | Fetching exact blockchain balance...", flush=True)
                     try:
-                        # 🛑 THE EXACT DECIMAL FIX (Only applies when exiting to prevent SL rejections)
                         bal_resp = client.get_balance_allowance(
                             BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
                         )
                         raw_balance = float(bal_resp.get("balance", 0)) / 1_000_000.0
                         
-                        # Truncate strictly to 4 decimal places to ensure we never ask to sell more than we own
                         safe_sell_size = int(raw_balance * 10000) / 10000.0
                         
                         if safe_sell_size < 0.01:
@@ -259,6 +292,9 @@ def run(live: bool):
         return
         
     print(f"✅ Market Found: {tokens['slug']}", flush=True)
+    
+    # NOTE: The new sniper logic returns 0.0 if volume doesn't match momentum.
+    # The BASE_THRESHOLD check in place_buy will catch it and prevent the trade.
     token_id = tokens["yes"] if mom > 0 else tokens["no"]
     
     if live:
