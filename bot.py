@@ -126,10 +126,7 @@ def compute_binance_trend():
         # Calculate Price Momentum
         price_momentum = ((current_close - old_close) / old_close) * 100.0
         
-        # Analyze Volume for the last 5 minutes 
-
-[Image of Volume Price Trend Indicator]
-
+        # Analyze Volume for the last 5 minutes
         total_volume = 0
         taker_buy_volume = 0
         
