@@ -18,7 +18,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # 🎯 STRATEGY SETTINGS (v17 - SNIPER MODE)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.1      # INCREASED: Needs a real breakout, not just noise.
+BASE_THRESHOLD = 0.15      # INCREASED: Needs a real breakout, not just noise.
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 10.0        # SCALED UP: $10 sniper shots.
 TAKE_PROFIT_PCT = 0.15     
