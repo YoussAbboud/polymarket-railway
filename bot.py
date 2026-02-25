@@ -18,7 +18,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 # 🎯 STRATEGY SETTINGS (v17 - SNIPER MODE)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.15      # INCREASED: Needs a real breakout, not just noise.
+BASE_THRESHOLD = 0.1      # INCREASED: Needs a real breakout, not just noise.
 MAX_SPREAD = 0.10          
 MAX_BET_SIZE = 10.0        # SCALED UP: $10 sniper shots.
 TAKE_PROFIT_PCT = 0.15     
@@ -141,12 +141,12 @@ def compute_binance_trend():
         print(f"🔍 Trend Check: Momentum {price_momentum:+.3f}% | Buy Pressure: {buy_pressure_pct:.1f}%", flush=True)
 
         # THE SNIPER FILTER: 
-        if price_momentum > 0 and buy_pressure_pct < 55.0:
-            print("⚠️ Price moved UP, but volume is weak. Ignoring fake-out.", flush=True)
+        if price_momentum > 0 and buy_pressure_pct < 52.0:
+            print(f"⚠️ Fake-out? Upward move but weak volume ({buy_pressure_pct:.1f}%).", flush=True)
             return 0.0 
             
-        if price_momentum < 0 and buy_pressure_pct > 45.0:
-            print("⚠️ Price moved DOWN, but sell volume is weak. Ignoring fake-out.", flush=True)
+        if price_momentum < 0 and buy_pressure_pct > 48.0:
+            print(f"⚠️ Fake-out? Downward move but weak sell volume (Buy={buy_pressure_pct:.1f}%).", flush=True)
             return 0.0
 
         return price_momentum
