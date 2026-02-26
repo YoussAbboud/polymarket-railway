@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Railway-ready Direct Polymarket Bot (v17 - Sniper Edition).
-- EXIT FIX: Fetches the exact blockchain balance right before selling.
-- ENTRY FIX: Requires high momentum (0.15%) AND dominant aggressive volume (>55%).
-- RISK MANAGEMENT: Max 1 trade per 15m window to prevent revenge trading.
-- DISCORD ALERTS: Active.
+Railway-ready Direct Polymarket Bot (v16.1 - The Discord Dispatcher).
+- DISCORD ALERTS: Pushes live notifications to a Discord Webhook when positions open and close.
+- CLEAN ENGINE: Retains the stable v16.0 sell logic, exact size matching, and hard time kill.
 """
 
 import os, sys, json, time, argparse, atexit
@@ -15,16 +13,16 @@ from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetTy
 from py_clob_client.order_builder.constants import BUY, SELL
 
 # ==============================================================================
-# 🎯 STRATEGY SETTINGS (v17 - SNIPER MODE)
+# 🎯 STRATEGY SETTINGS (v16.1)
 # ==============================================================================
 ASSET = "BTC"
-BASE_THRESHOLD = 0.15      # INCREASED: Needs a real breakout, not just noise.
+BASE_THRESHOLD = 0.04      
 MAX_SPREAD = 0.10          
-MAX_BET_SIZE = 10.0        # SCALED UP: $10 sniper shots.
-TAKE_PROFIT_PCT = 0.15     
-STOP_LOSS_PCT = 0.33       
+MAX_BET_SIZE = 5.0
+TAKE_PROFIT_PCT = 0.18     
+STOP_LOSS_PCT = 0.40       
 CLOSE_BUFFER_SECONDS = 120 
-MAX_TRADES_PER_WINDOW = 1  # DECREASED: 1 shot per window. No revenge trading.
+MAX_TRADES_PER_WINDOW = 3  
 # ==============================================================================
 
 HOST = "https://clob.polymarket.com"
@@ -109,6 +107,7 @@ def init_client():
     funder = get_env("POLYGON_ADDRESS")
     sig_type = int(os.getenv("SIGNATURE_TYPE", "1"))
     
+    print(f"🔐 Auth Init (Type {sig_type}) ...", flush=True)
     client = ClobClient(HOST, key=pk, chain_id=CHAIN_ID, signature_type=sig_type, funder=funder)
     client.set_api_creds(client.create_or_derive_api_creds())
     return client
@@ -119,41 +118,10 @@ def compute_binance_trend():
         data = safe_json(r)
         if not data or len(data) < 5: return None
         
-        # Extract closing prices
         old_close = float(data[0][4])
         current_close = float(data[-1][4])
-        
-        # Calculate Price Momentum
-        price_momentum = ((current_close - old_close) / old_close) * 100.0
-        
-        # Analyze Volume for the last 5 minutes
-        total_volume = 0
-        taker_buy_volume = 0
-        
-        for candle in data:
-            total_volume += float(candle[5])        # Total Base Volume
-            taker_buy_volume += float(candle[9])    # Taker Buy Base Asset Volume (Aggressive Buys)
-            
-        if total_volume == 0: return None
-        
-        buy_pressure_pct = (taker_buy_volume / total_volume) * 100.0
-        
-        print(f"🔍 Trend Check: Momentum {price_momentum:+.3f}% | Buy Pressure: {buy_pressure_pct:.1f}%", flush=True)
-
-        # THE SNIPER FILTER: 
-        if price_momentum > 0 and buy_pressure_pct < 52.0:
-            print(f"⚠️ Fake-out? Upward move but weak volume ({buy_pressure_pct:.1f}%).", flush=True)
-            return 0.0 
-            
-        if price_momentum < 0 and buy_pressure_pct > 48.0:
-            print(f"⚠️ Fake-out? Downward move but weak sell volume (Buy={buy_pressure_pct:.1f}%).", flush=True)
-            return 0.0
-
-        return price_momentum
-        
-    except Exception as e: 
-        print(f"⚠️ Binance Fetch Error: {e}")
-        return None
+        return ((current_close - old_close) / old_close) * 100.0
+    except: return None
 
 def get_market_tokens(base_ts: int):
     slugs = [f"btc-updown-15m-{base_ts}", f"btc-up-or-down-15m-{base_ts}"]
@@ -208,9 +176,30 @@ def place_buy(client: ClobClient, token_id: str, dollars: float, momentum: float
     if isinstance(resp, dict) and resp.get("error"):
         raise RuntimeError(f"Polymarket API rejected the BUY: {resp.get('error')}")
         
-    print(f"✅ Order sent. Trusting the fill.", flush=True)
-    send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
+    order_id = resp.get("orderID")
+    if not order_id:
+        raise RuntimeError(f"BUY order failed to confirm. API Response: {resp}")
+        
+    print(f"✅ Order sent (ID: {order_id}). Waiting 3s to verify fill...", flush=True)
+    time.sleep(3) 
     
+    try:
+        bal_resp = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        current_balance = float(bal_resp.get("balance", 0))
+        
+        if current_balance < (size * 0.5): 
+            print("⚠️ Price moved. Order stuck as an open maker order. Canceling...", flush=True)
+            try: client.cancel(order_id)
+            except: pass
+            raise RuntimeError("Order did not fill immediately. Canceled to prevent ghost trade.")
+    except Exception as e:
+        if "ghost trade" in str(e): raise e
+        pass 
+        
+    print("✅ Receipt confirmed.", flush=True)
+    send_discord_alert(f"🟢 **POSITION OPENED**\nAction: Bought **{size}** shares @ **${price:.2f}**\nBinance Momentum: `{momentum:+.3f}%`")
     return price, size
 
 def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime, entry_price: float, size: float):
@@ -239,22 +228,11 @@ def monitor_and_autoclose(client: ClobClient, token_id: str, end_time: datetime,
                 elif utc_now() >= target_time: trigger = "TIME LIMIT"
 
                 if trigger:
-                    print(f"🧾 EXITING POSITION: {trigger} | Fetching exact blockchain balance...", flush=True)
+                    print(f"🧾 EXITING POSITION: {trigger} | Executing sell order...", flush=True)
                     try:
-                        bal_resp = client.get_balance_allowance(
-                            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                        )
-                        raw_balance = float(bal_resp.get("balance", 0)) / 1_000_000.0
-                        
-                        safe_sell_size = int(raw_balance * 10000) / 10000.0
-                        
-                        if safe_sell_size < 0.01:
-                            print("❌ FATAL: 0 shares detected. Phantom trade or manual exit. Shutting down.", flush=True)
-                            return
-                            
-                        client.create_and_post_order(OrderArgs(price=0.01, size=safe_sell_size, side=SELL, token_id=token_id))
-                        print(f"✅ Sell order ({safe_sell_size} shares) executed successfully for {trigger}.", flush=True)
-                        send_discord_alert(f"🔴 **POSITION CLOSED** [{trigger}]\nAction: Sold **{safe_sell_size}** shares\nEntry: **${entry_price:.2f}** | Exit PnL: **{pct_pnl:+.1f}%**")
+                        client.create_and_post_order(OrderArgs(price=0.01, size=size, side=SELL, token_id=token_id))
+                        print(f"✅ Sell order ({size} shares) executed successfully for {trigger}.", flush=True)
+                        send_discord_alert(f"🔴 **POSITION CLOSED** [{trigger}]\nAction: Sold **{size}** shares\nEntry: **${entry_price:.2f}** | Exit PnL: **{pct_pnl:+.1f}%**")
                         return
                     except Exception as sell_err:
                         if "not enough balance" in str(sell_err).lower() or "allowance" in str(sell_err).lower():
@@ -289,9 +267,6 @@ def run(live: bool):
         return
         
     print(f"✅ Market Found: {tokens['slug']}", flush=True)
-    
-    # NOTE: The new sniper logic returns 0.0 if volume doesn't match momentum.
-    # The BASE_THRESHOLD check in place_buy will catch it and prevent the trade.
     token_id = tokens["yes"] if mom > 0 else tokens["no"]
     
     if live:
